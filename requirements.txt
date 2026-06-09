@@ -1,0 +1,7 @@
+valentine
+pandas
+anthropic
+python-dotenv
+google-genai
+pytest
+jupyter

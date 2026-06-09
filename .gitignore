@@ -1,0 +1,30 @@
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data files (large CSVs — too big for GitHub, not source code)
+schema-mapping/data/raw/
+schema-mapping/data/manufactured/
+schema-mapping/data/barrelSense/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
