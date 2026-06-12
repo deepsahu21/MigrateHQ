@@ -1,65 +1,68 @@
 """
-Stage 2 test — fully semantic renames (no lexical overlap between source and target).
+Stage 2 test — semantic renames (no lexical overlap between source and target).
 
 Ground truth:
-  order_id                    → transaction_ref
-  customer_id                 → buyer_key
-  order_status                → fulfillment_stage
-  order_purchase_timestamp    → created_at
-  order_approved_at           → confirmed_time
-  order_delivered_carrier_date  → shipped_date
-  order_delivered_customer_date → received_date
+  order_id                      → transaction_ref
+  customer_id                   → client_code
+  order_status                  → fulfillment_stage
+  order_purchase_timestamp      → initiated_at
+  order_approved_at             → payment_confirmed_time
+  order_delivered_carrier_date  → carrier_handoff_ts
+  order_delivered_customer_date → last_mile_completion_dt
   order_estimated_delivery_date → promised_date
 
 Strategy:
   - L1 (Valentine Jaccard) will fail on all 8 (no lexical overlap).
   - L2 uses semantic_match_batch() with semantically-grouped batches so the model
-    can apply mutual-exclusion reasoning (e.g., carrier date vs customer date).
+    can apply mutual-exclusion reasoning (e.g., carrier ts vs customer delivery dt).
+  - Results are dual-written to BigQuery + Supabase (client label: olist_orders_stage2_man).
 """
 import sys
 import os
+import uuid
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import pandas as pd
 from layer2_claude.reasoner import semantic_match_batch
 from orchestrator import print_results_table
+from bigquery_loader import push_mapping_to_bigquery, write_to_supabase
 from valentine import valentine_match
 from valentine.algorithms import JaccardDistanceMatcher
 
 GROUND_TRUTH = {
-    "order_id": "transaction_ref",
-    "customer_id": "buyer_key",
-    "order_status": "fulfillment_stage",
-    "order_purchase_timestamp": "created_at",
-    "order_approved_at": "confirmed_time",
-    "order_delivered_carrier_date": "shipped_date",
-    "order_delivered_customer_date": "received_date",
+    "order_id":                      "transaction_ref",
+    "customer_id":                   "client_code",
+    "order_status":                  "fulfillment_stage",
+    "order_purchase_timestamp":      "initiated_at",
+    "order_approved_at":             "payment_confirmed_time",
+    "order_delivered_carrier_date":  "carrier_handoff_ts",
+    "order_delivered_customer_date": "last_mile_completion_dt",
     "order_estimated_delivery_date": "promised_date",
 }
 
 SOURCE_CSV = "data/raw/olist_orders_dataset.csv"
-TARGET_CSV = "data/manufactured/olist_orders_stage2_manufactured.csv"
+TARGET_CSV = "data/manufactured/olist_orders_stage2_man.csv"
+CLIENT_LABEL = "olist_orders_stage2_man"
 
 L1_THRESHOLD = 0.8
 
-# Batch definitions: (batch_name, [source_cols], [target_cols])
-# Semantically related columns are grouped so Gemini reasons with mutual exclusion.
 BATCHES = [
     (
         "delivery-dates",
         ["order_delivered_carrier_date", "order_delivered_customer_date"],
-        ["shipped_date", "received_date"],
+        ["carrier_handoff_ts", "last_mile_completion_dt"],
     ),
     (
         "order-identifiers",
         ["order_id", "customer_id"],
-        ["transaction_ref", "buyer_key"],
+        ["transaction_ref", "client_code"],
     ),
     (
         "timestamps",
         ["order_purchase_timestamp", "order_approved_at", "order_estimated_delivery_date"],
-        ["created_at", "confirmed_time", "promised_date"],
+        ["initiated_at", "payment_confirmed_time", "promised_date"],
     ),
     (
         "status",
@@ -94,6 +97,9 @@ if __name__ == "__main__":
     target_cols = list(target_df.columns)
 
     print("\n=== Stage 2 Test: Semantic Renames (Batched L2) ===")
+    print(f"Source : {SOURCE_CSV}")
+    print(f"Target : {TARGET_CSV}")
+    print(f"Client : {CLIENT_LABEL}")
     print(f"Source cols: {source_cols}")
     print(f"Target cols: {target_cols}\n")
 
@@ -128,9 +134,7 @@ if __name__ == "__main__":
     l2_results: dict[str, dict] = {}
 
     for batch_name, src_cols, tgt_cols in BATCHES:
-        # Only process source cols that actually need L2
         active_src = [s for s in src_cols if s in escalated and s not in l2_results]
-        # Only offer target cols not yet claimed
         active_tgt = [t for t in tgt_cols if t not in claimed_targets]
 
         if not active_src:
@@ -157,23 +161,42 @@ if __name__ == "__main__":
             elif src:
                 l2_results[src] = {"target": None, "confidence": 0.0, "layer": "L2-no-match"}
 
-    # Any escalated cols not covered by a batch
     for src in escalated:
         if src not in l2_results:
             l2_results[src] = {"target": None, "confidence": 0.0, "layer": "none"}
 
     final_mapping.update(l2_results)
 
-    # ── Results ───────────────────────────────────────────────────────────────
+    # ── Results table ─────────────────────────────────────────────────────────
     print_results_table(final_mapping, ground_truth=GROUND_TRUTH)
 
+    # ── Per-column layer attribution ──────────────────────────────────────────
+    print("\n=== Per-Column Layer Attribution ===\n")
+    W = [35, 28, 14, 8, 8]
+    headers = ["source_col", "predicted_target", "layer", "conf", "correct"]
+    sep = "+-" + "-+-".join("-" * w for w in W) + "-+"
+    print(sep)
+    print("| " + " | ".join(h.ljust(w) for h, w in zip(headers, W)) + " |")
+    print(sep)
+    for src in sorted(final_mapping.keys()):
+        info = final_mapping[src]
+        tgt  = info.get("target") or "NO MATCH"
+        layer = info.get("layer", "—")
+        conf = f"{info.get('confidence', 0.0):.4f}"
+        hit  = "YES" if info.get("target") == GROUND_TRUTH.get(src) else "NO"
+        cells = [src.ljust(W[0]), tgt.ljust(W[1]), layer.ljust(W[2]),
+                 conf.ljust(W[3]), hit.ljust(W[4])]
+        print("| " + " | ".join(cells) + " |")
+    print(sep)
+
+    # ── Accuracy report ───────────────────────────────────────────────────────
     l1_correct, l1_total = score_mapping(final_mapping, GROUND_TRUTH, layer_filter="L1")
     l2_correct, l2_total = score_mapping(final_mapping, GROUND_TRUTH, layer_filter="L2")
     combined_correct, combined_total = score_mapping(final_mapping, GROUND_TRUTH)
 
     print("\n=== Accuracy Report ===")
-    print(f"  L1 (Valentine Jaccard):  {l1_correct}/{l1_total} — resolved at threshold")
-    print(f"  L2 (Gemini batched):     {l2_correct}/{l2_total} — escalated from L1")
+    print(f"  L1 (Valentine Jaccard):  {l1_correct}/{l1_total}")
+    print(f"  L2 (Gemini batched):     {l2_correct}/{l2_total}")
     print(f"  Combined:                {combined_correct}/{combined_total}")
 
     l2_wrong = [
@@ -186,21 +209,30 @@ if __name__ == "__main__":
     else:
         print("\n  L2 resolved all escalations correctly.")
 
+    # ── Dual-write to BigQuery + Supabase ─────────────────────────────────────
+    print(f"\nWriting run to BigQuery + Supabase (client={CLIENT_LABEL})…")
+    run_id = str(uuid.uuid4())
+    run_ts = datetime.now(timezone.utc).isoformat()
+
+    run_id = push_mapping_to_bigquery(
+        mapping_result=final_mapping,
+        source_dataset="olist_orders_dataset.csv",
+        target_dataset=TARGET_CSV.split("/")[-1],
+        notes="stage2 semantic renames",
+        run_id=run_id,
+    )
+
+    write_to_supabase(
+        mapping_result=final_mapping,
+        source_dataset=CLIENT_LABEL,
+        run_id=run_id,
+        run_timestamp=run_ts,
+    )
+
+    print(f"  run_id : {run_id}")
+
     if combined_correct == combined_total == len(GROUND_TRUTH):
-        print("\n  *** 8/8 — Stage 2 PASSED ***")
-        print("""
-## NEXT STEPS (after Stage 2 passes):
-
-1. STAGE 3: Load BarrelSense MongoDB data from schema-mapping/data/barrelSense/
-   - Pick two collections for testing
-   - Run L1 + L2 orchestration against them
-   - Report: accuracy, layer breakdown, confidence distribution
-   - Target: >= 80% accuracy on real production-like schema
-
-2. BUILD schema-mapping/src/layer3_human_review/ (after Stage 3 passes)
-   - Create a queue structure for low-confidence matches
-   - Store in BigQuery table: human_review_queue
-   - Columns: run_id, source_column, target_column, l1_confidence, l2_confidence, reasoning, status (pending/approved/rejected)
-
-3. REFACTOR orchestrator.py to push unresolved/low-confidence pairs to human_review_queue in BigQuery
-""")
+        print(f"\n*** {combined_correct}/{combined_total} — Stage 2 PASSED ***")
+    else:
+        missed = [s for s in GROUND_TRUTH if final_mapping.get(s, {}).get("target") != GROUND_TRUTH[s]]
+        print(f"\nStage 2 PARTIAL — misses: {missed}")

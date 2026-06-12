@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .venv/
+.venv-backend/
 venv/
 env/
 *.egg-info/
@@ -15,10 +16,17 @@ dist/
 build/
 .pytest_cache/
 
+# Node / Frontend
+node_modules/
+*.tsbuildinfo
+
 # Data files (large CSVs — too big for GitHub, not source code)
 schema-mapping/data/raw/
 schema-mapping/data/manufactured/
 schema-mapping/data/barrelSense/
+
+# Generated reports
+schema-mapping/reports/
 
 # macOS
 .DS_Store

@@ -3,7 +3,7 @@ from valentine import valentine_match
 from valentine.algorithms import JaccardDistanceMatcher
 
 df_a = pd.read_csv("data/raw/olist_orders_dataset.csv").sample(n=1000, random_state=42)
-df_b = pd.read_csv("data/manufactured/olist_orders_stage1_manufactured.csv", header=1).sample(n=1000, random_state=42)
+df_b = pd.read_csv("data/manufactured/olist_orders_stage1_man.csv", header=1).sample(n=1000, random_state=42)
 
 matcher = JaccardDistanceMatcher()
 matches = valentine_match(df_a, df_b, matcher)

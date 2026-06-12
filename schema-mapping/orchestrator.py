@@ -150,8 +150,8 @@ def print_results_table(final_mapping: dict, ground_truth: Optional[dict] = None
 
 if __name__ == "__main__":
     source_df = pd.read_csv("data/raw/olist_orders_dataset.csv").sample(n=100, random_state=42)
-    target_df = pd.read_csv("data/manufactured/olist_orders_stage2_manufactured.csv").sample(n=100, random_state=99)
+    target_df = pd.read_csv("data/manufactured/olist_orders_stage3_man.csv").sample(n=100, random_state=99)
 
-    print("\n=== Orchestrator: Stage 2 ===\n")
+    print("\n=== Orchestrator: Stage 3 ===\n")
     mapping = run_orchestrator(source_df, target_df)
     print_results_table(mapping)
