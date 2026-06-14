@@ -5,6 +5,8 @@ Run with: uvicorn main:app --reload --port 8000
 Auth: SUPABASE_URL + SUPABASE_SECRET_KEY in backend/.env
 """
 import os
+import re
+import time
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -325,6 +327,125 @@ def get_activity(x_tenant: Optional[str] = Header(None)):
         ]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/clients/{client_name}/mappings/{source_column}/explain")
+def explain_mapping(
+    client_name: str,
+    source_column: str,
+    x_tenant: Optional[str] = Header(None),
+):
+    """
+    Return a natural-language explanation for a flagged mapping.
+    Generates via Gemini on first call; caches in mapping_results.explanation.
+    """
+    tenant = x_tenant or "migratehq"
+    try:
+        if tenant.lower() != "migratehq":
+            if tenant.lower() not in client_name.lower():
+                raise HTTPException(status_code=403, detail="Access denied for this client")
+
+        client_resp = sb.table("clients").select("id").eq("source_dataset", client_name).execute()
+        if not client_resp.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        client_id = client_resp.data[0]["id"]
+
+        run_resp = (
+            sb.table("mapping_runs")
+            .select("run_id")
+            .eq("client_id", client_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not run_resp.data:
+            raise HTTPException(status_code=404, detail="No runs found")
+        run_id = run_resp.data[0]["run_id"]
+
+        # Select all columns so this works even if explanation/sample columns
+        # haven't been migrated yet — new fields will simply be absent from the row.
+        row_resp = (
+            sb.table("mapping_results")
+            .select("*")
+            .eq("run_id", run_id)
+            .eq("source_column", source_column)
+            .execute()
+        )
+        if not row_resp.data:
+            raise HTTPException(status_code=404, detail="Mapping row not found")
+        row = row_resp.data[0]
+
+        if row.get("explanation"):
+            return {"explanation": row["explanation"], "cached": True}
+
+        explanation = _generate_explanation(row)
+
+        if explanation:
+            try:
+                sb.table("mapping_results").update({"explanation": explanation}).eq("id", row["id"]).execute()
+            except Exception:
+                pass  # non-fatal — still return the explanation
+
+        return {"explanation": explanation, "cached": False}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _generate_explanation(row: dict) -> Optional[str]:
+    """Call Gemini to produce a human-readable mapping explanation. Returns None on failure."""
+    gemini_key = os.environ.get("GOOGLE_API_KEY")
+    if not gemini_key:
+        return None
+
+    src_samples = row.get("source_samples") or []
+    tgt_samples = row.get("target_samples") or []
+    target_col  = row.get("target_column") or "no match"
+    layer       = row.get("layer", "")
+    confidence  = float(row.get("confidence") or 0.0)
+
+    layer_desc = {
+        "L1":         "lexical/string similarity matching",
+        "L2":         "AI semantic reasoning",
+        "L1-fallback":"low-confidence fallback from string matching",
+        "none":       "no match found",
+    }.get(layer, "automated matching")
+
+    samples_block = ""
+    if src_samples:
+        samples_block += f"\nSource column sample values: {src_samples[:5]}"
+    if tgt_samples:
+        samples_block += f"\nTarget column sample values: {tgt_samples[:5]}"
+
+    prompt = f"""You are explaining a database column mapping to a non-technical operations reviewer.
+
+Source column: '{row["source_column"]}'
+Predicted target column: '{target_col}'
+Detection method: {layer_desc}
+Confidence: {confidence:.0%}{samples_block}
+
+Write 1-2 sentences in plain English:
+- State WHY these two columns likely match (or why the match may be wrong)
+- Reference column names and sample values where available to make it concrete
+- Flag any concern if the match seems questionable at this confidence level
+
+Return ONLY the explanation — no JSON, no bullet points, no preamble."""
+
+    try:
+        from google import genai as google_genai
+        gemini = google_genai.Client(api_key=gemini_key)
+
+        # Single attempt — don't retry inside an interactive HTTP request.
+        # 429s have long retry-after windows (30s+) that would time out the UI.
+        response = gemini.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception:
+        return None
 
 
 @app.get("/health")

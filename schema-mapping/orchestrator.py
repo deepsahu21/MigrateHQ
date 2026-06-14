@@ -69,7 +69,15 @@ def run_orchestrator(
         ranked = candidates.get(src, [])
         if ranked and ranked[0][1] >= threshold:
             best_tgt, best_score = ranked[0]
-            final_mapping[src] = {"target": best_tgt, "confidence": best_score, "layer": "L1"}
+            src_samples = source_df[src].dropna().astype(str).head(5).tolist()
+            tgt_samples = target_df[best_tgt].dropna().astype(str).head(5).tolist() if best_tgt in target_df.columns else []
+            final_mapping[src] = {
+                "target": best_tgt,
+                "confidence": best_score,
+                "layer": "L1",
+                "source_samples": src_samples,
+                "target_samples": tgt_samples,
+            }
             claimed_targets.add(best_tgt)
         else:
             escalate.append(src)
@@ -96,6 +104,8 @@ def run_orchestrator(
                 "target": matched_tgt,
                 "confidence": result.get("confidence", 0.0),
                 "layer": "L2",
+                "source_samples": src_samples,
+                "target_samples": target_samples_map.get(matched_tgt, []),
             }
             claimed_targets.add(matched_tgt)
         else:
@@ -103,15 +113,24 @@ def run_orchestrator(
             ranked = candidates.get(src, [])
             for best_tgt, best_score in ranked:
                 if best_tgt not in claimed_targets:
+                    tgt_fb_samples = target_df[best_tgt].dropna().astype(str).head(5).tolist() if best_tgt in target_df.columns else []
                     final_mapping[src] = {
                         "target": best_tgt,
                         "confidence": best_score,
                         "layer": "L1-fallback",
+                        "source_samples": src_samples,
+                        "target_samples": tgt_fb_samples,
                     }
                     claimed_targets.add(best_tgt)
                     break
             else:
-                final_mapping[src] = {"target": None, "confidence": 0.0, "layer": "none"}
+                final_mapping[src] = {
+                    "target": None,
+                    "confidence": 0.0,
+                    "layer": "none",
+                    "source_samples": src_samples,
+                    "target_samples": [],
+                }
 
     return final_mapping
 

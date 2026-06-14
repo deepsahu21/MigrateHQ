@@ -7,8 +7,8 @@ Ground truth:
   order_status                  → LifecyclePhase
   order_purchase_timestamp      → InitiationTime
   order_approved_at             → ConfirmedWhen
-  order_delivered_carrier_date  → DispatchEvent
-  order_delivered_customer_date → CompletionEvent
+  order_delivered_carrier_date  → HubDepartureDate
+  order_delivered_customer_date → InboundReceiptDate
   order_estimated_delivery_date → WindowClose
 
 Strategy:
@@ -44,8 +44,8 @@ GROUND_TRUTH = {
     "order_status":                  "LifecyclePhase",
     "order_purchase_timestamp":      "InitiationTime",
     "order_approved_at":             "ConfirmedWhen",
-    "order_delivered_carrier_date":  "DispatchEvent",
-    "order_delivered_customer_date": "CompletionEvent",
+    "order_delivered_carrier_date":  "HubDepartureDate",
+    "order_delivered_customer_date": "InboundReceiptDate",
     "order_estimated_delivery_date": "WindowClose",
 }
 

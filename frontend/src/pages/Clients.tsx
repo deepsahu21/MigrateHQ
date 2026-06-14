@@ -1,11 +1,19 @@
-import { useState, useEffect } from 'react'
-import { AlertTriangle, Clock } from 'lucide-react'
+import { useState, useEffect, Fragment } from 'react'
+import { AlertTriangle, Clock, ChevronDown } from 'lucide-react'
 import StatusBadge from '../components/StatusBadge'
 import ConfidenceBadge from '../components/ConfidenceBadge'
 import LayerBadge from '../components/LayerBadge'
 import { api, ApiClient, ApiMappingResult, ApiRunHistory } from '../lib/api'
+
+interface ExplainState {
+  text: string | null
+  loading: boolean
+  error: boolean
+}
 import { getClientDisplayName, getClientStatus, formatTimestamp } from '../lib/utils'
 import { Session } from '../lib/auth'
+
+type DetailTab = 'mappings' | 'history' | 'queue'
 
 interface ClientsProps {
   session: Session
@@ -20,6 +28,9 @@ export default function Clients({ session }: ClientsProps) {
   const [loadingDetail,  setLoadingDetail]  = useState(false)
   const [listError,      setListError]      = useState<string | null>(null)
   const [detailError,    setDetailError]    = useState<string | null>(null)
+  const [activeTab,      setActiveTab]      = useState<DetailTab>('mappings')
+  const [expandedRow,    setExpandedRow]    = useState<string | null>(null)
+  const [explanations,   setExplanations]   = useState<Record<string, ExplainState>>({})
 
   useEffect(() => {
     setLoadingList(true)
@@ -39,11 +50,34 @@ export default function Clients({ session }: ClientsProps) {
       .finally(() => setLoadingList(false))
   }, [])
 
+  async function handleExpandRow(r: ApiMappingResult) {
+    const col = r.source_column
+    if (expandedRow === col) {
+      setExpandedRow(null)
+      return
+    }
+    setExpandedRow(col)
+    if (explanations[col]) return
+
+    setExplanations(prev => ({ ...prev, [col]: { text: null, loading: true, error: false } }))
+    try {
+      const result = await api.explain(selectedClient!.client_name, col)
+      setExplanations(prev => ({
+        ...prev,
+        [col]: { text: result.explanation, loading: false, error: result.explanation === null },
+      }))
+    } catch {
+      setExplanations(prev => ({ ...prev, [col]: { text: null, loading: false, error: true } }))
+    }
+  }
+
   function selectClient(c: ApiClient) {
     setSelectedClient(c)
     setMappings([])
     setRunHistory([])
     setDetailError(null)
+    setExpandedRow(null)
+    setExplanations({})
     setLoadingDetail(true)
     Promise.all([
       api.mappings(c.client_name),
@@ -144,170 +178,222 @@ export default function Clients({ session }: ClientsProps) {
                 </div>
               </div>
 
-              {/* Column mappings from latest run */}
-              <div className="table-card section-gap">
-                <div className="table-card-header">
-                  <span className="table-card-title">Column Mappings</span>
-                  {!loadingDetail && (
-                    <span className="table-card-count">{mappings.length} columns</span>
-                  )}
-                </div>
-                {loadingDetail ? (
-                  <div className="loading-state"><div className="spinner" />Loading mappings…</div>
-                ) : detailError ? (
-                  <div className="error-state">
-                    <div className="error-message">{detailError}</div>
-                  </div>
-                ) : mappings.length === 0 ? (
-                  <div className="empty-state">No mapping results found</div>
-                ) : (
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Source Column</th>
-                        <th>Target Column</th>
-                        <th>Confidence</th>
-                        <th>Layer</th>
-                        <th>Correct</th>
-                        <th>Flagged</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {mappings.map((r) => (
-                        <tr key={r.source_column}>
-                          <td className="font-mono">{r.source_column}</td>
-                          <td className="font-mono">{r.target_column ?? <span className="text-muted">— no match —</span>}</td>
-                          <td><ConfidenceBadge value={r.confidence} /></td>
-                          <td><LayerBadge layer={r.layer} /></td>
-                          <td>
-                            {r.correct === null
-                              ? <span className="text-muted">—</span>
-                              : r.correct
-                                ? <span style={{ color: 'var(--green-text)', fontWeight: 500 }}>Yes</span>
-                                : <span style={{ color: 'var(--red-text)',   fontWeight: 500 }}>No</span>
-                            }
-                          </td>
-                          <td>
-                            {r.flagged_for_review
-                              ? <span className="flag-icon"><AlertTriangle size={14} /></span>
-                              : <span className="text-muted">—</span>
-                            }
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-
-              {/* Run History */}
-              <div className="table-card section-gap">
-                <div className="table-card-header">
-                  <span className="table-card-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <Clock size={14} /> Run History
-                  </span>
-                  {!loadingDetail && (
-                    <span className="table-card-count">{runHistory.length} runs</span>
-                  )}
-                </div>
-                {loadingDetail ? (
-                  <div className="loading-state" style={{ padding: 24 }}><div className="spinner" /></div>
-                ) : runHistory.length === 0 ? (
-                  <div className="empty-state">No run history found</div>
-                ) : (
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Run ID</th>
-                        <th>Date</th>
-                        <th>Columns</th>
-                        <th>L1</th>
-                        <th>L2</th>
-                        <th>Fallback</th>
-                        <th>Accuracy</th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {runHistory.map((r, idx) => (
-                        <tr key={r.run_id}>
-                          <td className="font-mono" style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>
-                            {r.run_id.slice(0, 8)}…
-                            {idx === 0 && (
-                              <span style={{ marginLeft: 6, fontSize: '0.65rem', background: 'var(--blue-bg)', color: 'var(--blue-text)', borderRadius: 4, padding: '1px 5px' }}>
-                                latest
-                              </span>
-                            )}
-                          </td>
-                          <td>{formatTimestamp(r.created_at)}</td>
-                          <td>{r.total_columns ?? '—'}</td>
-                          <td style={{ color: 'var(--blue-text)' }}>{r.l1_count ?? '—'}</td>
-                          <td style={{ color: 'var(--purple-text)' }}>{r.l2_count ?? '—'}</td>
-                          <td style={{ color: 'var(--gray-text)' }}>{r.fallback_count ?? '—'}</td>
-                          <td>
-                            {r.accuracy_pct != null
-                              ? <span style={{ fontWeight: 500 }}>{r.accuracy_pct.toFixed(1)}%</span>
-                              : '—'
-                            }
-                          </td>
-                          <td>
-                            <span style={{
-                              fontSize: '0.75rem',
-                              padding: '2px 8px',
-                              borderRadius: 4,
-                              background: r.status === 'completed' ? 'var(--green-bg)' : 'var(--amber-bg)',
-                              color:      r.status === 'completed' ? 'var(--green-text)' : 'var(--amber-text)',
-                            }}>
-                              {r.status ?? 'unknown'}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-
-              {/* Review queue */}
+              {/* Tabbed detail sections */}
               <div className="table-card">
-                <div className="table-card-header">
-                  <span className="table-card-title">Review Queue</span>
-                  {!loadingDetail && (
-                    <span className="table-card-count">{reviewQueue.length} items</span>
-                  )}
+                {/* Tab bar */}
+                <div className="detail-tabs">
+                  <button
+                    className={`detail-tab${activeTab === 'mappings' ? ' active' : ''}`}
+                    onClick={() => setActiveTab('mappings')}
+                  >
+                    Column Mappings
+                    {!loadingDetail && <span className="detail-tab-badge">{mappings.length}</span>}
+                  </button>
+                  <button
+                    className={`detail-tab${activeTab === 'history' ? ' active' : ''}`}
+                    onClick={() => setActiveTab('history')}
+                  >
+                    <Clock size={13} /> Run History
+                    {!loadingDetail && <span className="detail-tab-badge">{runHistory.length}</span>}
+                  </button>
+                  <button
+                    className={`detail-tab${activeTab === 'queue' ? ' active' : ''}`}
+                    onClick={() => setActiveTab('queue')}
+                  >
+                    Review Queue
+                    {!loadingDetail && reviewQueue.length > 0 && (
+                      <span className="detail-tab-badge detail-tab-badge--amber">{reviewQueue.length}</span>
+                    )}
+                  </button>
                 </div>
-                {loadingDetail ? (
-                  <div className="loading-state" style={{ padding: 24 }}><div className="spinner" /></div>
-                ) : reviewQueue.length === 0 ? (
-                  <div className="empty-state">No columns flagged for review</div>
-                ) : (
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Source Column</th>
-                        <th>Predicted Target</th>
-                        <th>Confidence</th>
-                        <th>Layer</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {reviewQueue.map((r) => (
-                        <tr key={r.source_column}>
-                          <td className="font-mono">{r.source_column}</td>
-                          <td className="font-mono">{r.target_column ?? '—'}</td>
-                          <td><ConfidenceBadge value={r.confidence} /></td>
-                          <td><LayerBadge layer={r.layer} /></td>
-                          <td>
-                            <div className="review-actions">
-                              <button className="btn btn-approve">Approve</button>
-                              <button className="btn btn-override">Override</button>
-                            </div>
-                          </td>
+
+                {/* Mappings panel */}
+                {activeTab === 'mappings' && (
+                  loadingDetail ? (
+                    <div className="loading-state"><div className="spinner" />Loading mappings…</div>
+                  ) : detailError ? (
+                    <div className="error-state"><div className="error-message">{detailError}</div></div>
+                  ) : mappings.length === 0 ? (
+                    <div className="empty-state">No mapping results found</div>
+                  ) : (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Source Column</th>
+                          <th>Target Column</th>
+                          <th>Confidence</th>
+                          <th>Layer</th>
+                          <th>Correct</th>
+                          <th>Flagged</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {mappings.map((r) => (
+                          <tr key={r.source_column}>
+                            <td className="font-mono">{r.source_column}</td>
+                            <td className="font-mono">{r.target_column ?? <span className="text-muted">— no match —</span>}</td>
+                            <td><ConfidenceBadge value={r.confidence} /></td>
+                            <td><LayerBadge layer={r.layer} /></td>
+                            <td>
+                              {r.correct === null
+                                ? <span className="text-muted">—</span>
+                                : r.correct
+                                  ? <span style={{ color: 'var(--green-text)', fontWeight: 500 }}>Yes</span>
+                                  : <span style={{ color: 'var(--red-text)',   fontWeight: 500 }}>No</span>
+                              }
+                            </td>
+                            <td>
+                              {r.flagged_for_review
+                                ? <span className="flag-icon"><AlertTriangle size={14} /></span>
+                                : <span className="text-muted">—</span>
+                              }
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                )}
+
+                {/* Run history panel */}
+                {activeTab === 'history' && (
+                  loadingDetail ? (
+                    <div className="loading-state"><div className="spinner" /></div>
+                  ) : runHistory.length === 0 ? (
+                    <div className="empty-state">No run history found</div>
+                  ) : (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Run ID</th>
+                          <th>Date</th>
+                          <th>Columns</th>
+                          <th>L1</th>
+                          <th>L2</th>
+                          <th>Fallback</th>
+                          <th>Accuracy</th>
+                          <th>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {runHistory.map((r, idx) => (
+                          <tr key={r.run_id}>
+                            <td className="font-mono" style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>
+                              {r.run_id.slice(0, 8)}…
+                              {idx === 0 && (
+                                <span style={{ marginLeft: 6, fontSize: '0.65rem', background: 'var(--blue-bg)', color: 'var(--blue-text)', borderRadius: 4, padding: '1px 5px' }}>
+                                  latest
+                                </span>
+                              )}
+                            </td>
+                            <td>{formatTimestamp(r.created_at)}</td>
+                            <td>{r.total_columns ?? '—'}</td>
+                            <td style={{ color: 'var(--blue-text)' }}>{r.l1_count ?? '—'}</td>
+                            <td style={{ color: 'var(--purple-text)' }}>{r.l2_count ?? '—'}</td>
+                            <td style={{ color: 'var(--gray-text)' }}>{r.fallback_count ?? '—'}</td>
+                            <td>
+                              {r.accuracy_pct != null
+                                ? <span style={{ fontWeight: 500 }}>{r.accuracy_pct.toFixed(1)}%</span>
+                                : '—'
+                              }
+                            </td>
+                            <td>
+                              <span style={{
+                                fontSize: '0.75rem',
+                                padding: '2px 8px',
+                                borderRadius: 4,
+                                background: r.status === 'completed' ? 'var(--green-bg)' : 'var(--amber-bg)',
+                                color:      r.status === 'completed' ? 'var(--green-text)' : 'var(--amber-text)',
+                              }}>
+                                {r.status ?? 'unknown'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                )}
+
+                {/* Review queue panel */}
+                {activeTab === 'queue' && (
+                  loadingDetail ? (
+                    <div className="loading-state"><div className="spinner" /></div>
+                  ) : reviewQueue.length === 0 ? (
+                    <div className="empty-state">No columns flagged for review</div>
+                  ) : (
+                    <>
+                      <div className="queue-hint">Click a row to see an explanation of why this mapping was flagged.</div>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Source Column</th>
+                            <th>Predicted Target</th>
+                            <th>Confidence</th>
+                            <th>Layer</th>
+                            <th>Actions</th>
+                            <th style={{ width: 32 }} />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reviewQueue.map((r) => {
+                            const exp = explanations[r.source_column]
+                            const isOpen = expandedRow === r.source_column
+                            return (
+                              <Fragment key={r.source_column}>
+                                <tr
+                                  className="clickable queue-row"
+                                  onClick={() => handleExpandRow(r)}
+                                  aria-expanded={isOpen}
+                                >
+                                  <td className="font-mono">{r.source_column}</td>
+                                  <td className="font-mono">{r.target_column ?? '—'}</td>
+                                  <td><ConfidenceBadge value={r.confidence} /></td>
+                                  <td><LayerBadge layer={r.layer} /></td>
+                                  <td>
+                                    <div className="review-actions" onClick={e => e.stopPropagation()}>
+                                      <button className="btn btn-approve">Approve</button>
+                                      <button className="btn btn-override">Override</button>
+                                    </div>
+                                  </td>
+                                  <td className="queue-chevron-cell">
+                                    <ChevronDown
+                                      size={14}
+                                      className={`queue-chevron${isOpen ? ' open' : ''}`}
+                                    />
+                                  </td>
+                                </tr>
+                                {isOpen && (
+                                  <tr className="explanation-row">
+                                    <td colSpan={6} className="explanation-cell">
+                                      {exp?.loading ? (
+                                        <div className="explanation-loading">
+                                          <div className="spinner-sm" />
+                                          Generating explanation…
+                                        </div>
+                                      ) : exp?.error || exp?.text === null ? (
+                                        <p className="explanation-fallback">
+                                          Explanation temporarily unavailable — please review manually based on the column names and confidence score above.
+                                        </p>
+                                      ) : exp?.text ? (
+                                        <div className="explanation-content">
+                                          <p className="explanation-text">{exp.text}</p>
+                                          <div className="explanation-meta">
+                                            <ConfidenceBadge value={r.confidence} />
+                                            <LayerBadge layer={r.layer} />
+                                          </div>
+                                        </div>
+                                      ) : null}
+                                    </td>
+                                  </tr>
+                                )}
+                              </Fragment>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </>
+                  )
                 )}
               </div>
             </div>

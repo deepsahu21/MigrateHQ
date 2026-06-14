@@ -93,8 +93,28 @@ def main():
 
     logger.info("Inserted/upserted %d runs", runs_inserted)
 
-    # ── Insert mapping_results ──────────────────────────────────────────────
-    # Batch insert in chunks of 500 to avoid oversized requests
+    # ── Insert mapping_results (skip run_ids already in Supabase) ──────────
+    all_run_ids = list({r.run_id for r in bq_results})
+    already_loaded: set[str] = set()
+    # Check in batches of 100 (PostgREST .in_() limit is generous but be safe)
+    BATCH = 100
+    for i in range(0, len(all_run_ids), BATCH):
+        slice_ids = all_run_ids[i : i + BATCH]
+        existing = (
+            sb.table("mapping_results")
+            .select("run_id")
+            .in_("run_id", slice_ids)
+            .limit(len(slice_ids) * 50)   # upper bound: 50 cols per run
+            .execute()
+        )
+        already_loaded.update(r["run_id"] for r in existing.data)
+
+    if already_loaded:
+        logger.info(
+            "Skipping %d run_id(s) already in mapping_results: %s",
+            len(already_loaded), sorted(already_loaded),
+        )
+
     result_rows = [
         {
             "run_id":           r.run_id,
@@ -106,6 +126,7 @@ def main():
             "flagged_for_review": (r.confidence or 0.0) < 0.75,
         }
         for r in bq_results
+        if r.run_id not in already_loaded
     ]
 
     CHUNK = 500

@@ -99,6 +99,7 @@ if __name__ == "__main__":
         dataset_name="olist_stage1",
         sample_size=100,
         notes="e2e test — stage 1 shallow renames",
+        client_label="olist_orders_stage1_man",
         # Stage 1 target CSV has a spurious title row before the real header
         target_csv_kwargs={"skiprows": 1},
     )

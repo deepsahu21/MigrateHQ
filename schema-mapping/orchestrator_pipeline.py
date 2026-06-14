@@ -82,11 +82,15 @@ def run_mapping_pipeline(
     l2_count = sum(1 for v in mapping.values() if v.get("layer") == "L2")
     fallback_count = sum(1 for v in mapping.values() if v.get("layer") == "L1-fallback")
 
+    # Use the same label for both BigQuery and Supabase so source_dataset
+    # is consistent across both stores.
+    source_label = client_label or os.path.basename(source_csv_path)
+
     # ── Push to BigQuery ──────────────────────────────────────────────────────
     try:
         run_id = push_mapping_to_bigquery(
             mapping_result=mapping,
-            source_dataset=os.path.basename(source_csv_path),
+            source_dataset=source_label,
             target_dataset=os.path.basename(target_csv_path),
             notes=notes or f"pipeline:{dataset_name}",
         )
@@ -104,7 +108,7 @@ def run_mapping_pipeline(
     # ── Mirror to Supabase (non-fatal) ────────────────────────────────────────
     write_to_supabase(
         mapping_result=mapping,
-        source_dataset=client_label or os.path.basename(source_csv_path),
+        source_dataset=source_label,
         run_id=run_id,
         run_timestamp=datetime.now(timezone.utc).isoformat(),
     )

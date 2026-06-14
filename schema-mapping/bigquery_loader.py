@@ -217,6 +217,8 @@ def write_to_supabase(
                 "layer":            info.get("layer"),
                 "correct":          None,
                 "flagged_for_review": (info.get("confidence") or 0.0) < 0.75,
+                "source_samples":   info.get("source_samples"),
+                "target_samples":   info.get("target_samples"),
             }
             for src, info in mapping_result.items()
         ]

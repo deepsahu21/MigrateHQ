@@ -1,11 +1,23 @@
 import { getSession } from './auth'
 
-async function apiFetch<T>(path: string): Promise<T> {
+function buildHeaders(): Record<string, string> {
   const session = getSession()
   const headers: Record<string, string> = {}
   if (session?.tenant) headers['X-Tenant'] = session.tenant
+  return headers
+}
 
-  const res = await fetch(path, { headers })
+async function apiFetch<T>(path: string): Promise<T> {
+  const res = await fetch(path, { headers: buildHeaders() })
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`${res.status}: ${body || res.statusText}`)
+  }
+  return res.json() as Promise<T>
+}
+
+async function apiPost<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'POST', headers: buildHeaders() })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
     throw new Error(`${res.status}: ${body || res.statusText}`)
@@ -22,6 +34,9 @@ export const api = {
   ),
   runs: (clientName: string)           => apiFetch<ApiRunHistory[]>(
     `/api/clients/${encodeURIComponent(clientName)}/runs`
+  ),
+  explain: (clientName: string, sourceColumn: string) => apiPost<ApiExplanation>(
+    `/api/clients/${encodeURIComponent(clientName)}/mappings/${encodeURIComponent(sourceColumn)}/explain`
   ),
 }
 
@@ -74,4 +89,10 @@ export interface ApiMappingResult {
   layer: 'L1' | 'L2' | 'L1-fallback' | 'none'
   correct: boolean | null
   flagged_for_review: boolean
+}
+
+export interface ApiExplanation {
+  explanation: string | null
+  cached?: boolean
+  error?: string
 }
