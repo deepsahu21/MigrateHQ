@@ -1,0 +1,223 @@
+TASK
+Write a Google Apps Script that monitors a Gmail inbox, extracts CSV attachments
+and email body data, and POSTs them to the /api/ingest endpoint.
+
+---
+
+FILES CHANGED
+
+1. schema-mapping/integration/gmail_ingest.gs — new file (full script, ~270 lines)
+   Directory schema-mapping/integration/ created.
+
+Functions:
+  _getConfig()               — reads all config from ScriptProperties; throws clearly
+                               if TARGET_SCHEMA_URL and TARGET_SCHEMA_B64 are both unset
+  setupTrigger()             — installs 5-min time-driven trigger; idempotent check first
+  removeTriggers()           — removes all triggers for checkInbox() (for re-deploy)
+  checkInbox()               — main entry point: search label for unread, call _processMessage()
+  _labelQuery(label)         — converts label name to Gmail search syntax (wraps in quotes)
+  _processMessage(msg, cfg)  — per-message orchestration: find CSVs, parse subject,
+                               fetch target schema, call postToIngest(), apply error policy
+  _parseSubject(subject,cfg) — extracts client:<name> and tenant:<name> tokens from subject
+  _getTargetSchemaBlob(cfg)  — fetches target schema from URL or decodes from base64 property
+  postToIngest(...)          — builds multipart POST to /api/ingest; returns response or
+                               sentinel values signaling error policy
+  testApiConnection()        — manual helper: GET /health to verify config + connectivity
+  previewInbox()             — manual helper: list up to 5 unread threads without processing
+
+---
+
+WHAT WAS BUILT
+
+A standalone Google Apps Script file that implements the full email-to-pipeline ingest loop:
+
+1. CONFIGURATION
+   Six Script Properties, read at runtime via PropertiesService.getScriptProperties():
+     MIGRATEHQ_API_BASE_URL   — API root (default: http://localhost:8000)
+     MIGRATEHQ_API_TOKEN      — Bearer token (sent in Authorization header if set)
+     GMAIL_LABEL              — Gmail label to monitor (default: "MigrateHQ/Ingest")
+     TARGET_SCHEMA_URL        — HTTPS URL to target WMS schema CSV (fetched via UrlFetchApp)
+     TARGET_SCHEMA_B64        — Alternative: base64-encoded target CSV as a Script Property
+     DEFAULT_CLIENT_NAME      — Fallback client_name if not parsed from subject
+     DEFAULT_TENANT           — Fallback X-Tenant value (default: "migratehq")
+
+2. TRIGGER SETUP
+   setupTrigger() checks existing triggers before creating a new one (idempotent).
+   Uses ScriptApp.newTrigger('checkInbox').timeBased().everyMinutes(5).create().
+   Must be run once manually from the Apps Script editor. No trigger name field exists
+   in the Apps Script trigger API — the handler function name ("checkInbox") serves
+   as the identifier.
+
+3. INBOX SCANNING (checkInbox)
+   Uses GmailApp.search('label:"MigrateHQ/Ingest" is:unread') to find threads.
+   Iterates all messages in each thread, skipping already-read messages.
+   Delegates each unread message to _processMessage().
+
+4. MESSAGE PROCESSING (_processMessage)
+   - Extracts all .csv attachments by filename suffix
+   - If no CSV: logs warning, marks read (no point retrying — sender must re-send)
+   - If multiple CSVs: uses first, logs warning about limitation
+   - Parses subject for client:<name> and tenant:<name> tokens
+   - Fetches target schema blob via _getTargetSchemaBlob()
+   - Calls postToIngest() and applies the error policy (see below)
+
+5. TARGET SCHEMA STRATEGY
+   The /api/ingest endpoint requires both a source file and a target schema CSV.
+   The target schema is stable (the WMS template), not per-email. Two options:
+     a) TARGET_SCHEMA_URL: fetch the file at runtime via UrlFetchApp. Recommended:
+        upload target CSV to Google Drive, share with link, get direct CSV URL.
+     b) TARGET_SCHEMA_B64: base64-encoded CSV stored as a Script Property. Useful
+        for environments where Drive URL is unavailable.
+   If neither is configured, the script throws a clear error and halts (the email
+   stays unread for manual resolution).
+
+6. API CALL (postToIngest)
+   Builds a multipart/form-data POST using UrlFetchApp's native payload object support
+   (Apps Script handles boundary/encoding automatically when payload contains Blobs).
+   Fields: source_file (blob), target_file (blob), client_name (string).
+   Headers: X-Tenant, Authorization (Bearer token, omitted if token is empty).
+
+7. ERROR POLICY
+   HTTP 200-299         → parse JSON, log run_id + accuracy, mark email as read
+   HTTP 400/413/422     → log error (user/validation error), mark as read (no retry)
+   HTTP 404             → log error (unknown tenant/endpoint), mark as read (no retry)
+   HTTP 5xx             → log warning, leave unread (retry next 5-min cycle)
+   Network exception    → log warning, leave unread (retry next cycle)
+   No CSV attachment    → log warning, mark as read (user must re-send)
+   Target schema error  → log error, leave unread (config issue, retry after fix)
+
+8. LOGGING
+   Logger.log() used for all output (visible in Apps Script Runtime Logs).
+   Every log line includes: message ID, sender, subject, filename, HTTP code, run_id.
+   Logger.warn() is not a standard Apps Script method — warnings use Logger.log()
+   with a "WARNING:" prefix (Apps Script's Logger does not have severity levels).
+
+---
+
+HOW IT WAS TESTED
+
+This is a Google Apps Script file. It cannot be executed locally (no Node.js runtime,
+no GmailApp/UrlFetchApp, no ScriptApp outside Google's V8 runtime). Testing was
+not performed live. The following was verified by code inspection:
+
+- setupTrigger() checks getProjectTriggers() for an existing 'checkInbox' handler
+  before creating a new one — idempotency confirmed by logic review.
+- _labelQuery() wraps the label in quotes — correct for nested Gmail labels with "/".
+- _parseSubject() uses case-insensitive regex match with a non-space capture group.
+- Error policy branches cover all documented HTTP status codes from /api/ingest:
+  - 400 (validation fail), 413 (file too large), 422 (pipeline error), 5xx (server).
+- UrlFetchApp.fetch() with muteHttpExceptions: true prevents uncaught exceptions
+  on non-200 responses — the response code is checked manually.
+- The multipart payload uses UrlFetchApp's built-in Blob handling (passing a Blob
+  object as a field value triggers multipart encoding automatically — documented
+  Google behavior, no manual boundary construction needed).
+
+Manual test functions (testApiConnection, previewInbox) were written to allow
+live verification from the Apps Script editor without triggering real email processing.
+
+---
+
+ASSUMPTIONS MADE
+
+1. UrlFetchApp multipart encoding. Apps Script's UrlFetchApp automatically encodes
+   a payload dict containing Blob values as multipart/form-data, handling MIME
+   boundaries and Content-Disposition headers. This is documented Google behavior.
+   The field names ('source_file', 'target_file', 'client_name') match what FastAPI
+   expects from the /api/ingest endpoint.
+
+2. GmailApp.search() with nested labels. Gmail API label search syntax requires
+   quoting labels that contain "/". The _labelQuery() function wraps the label name
+   in double quotes. This handles "MigrateHQ/Ingest" correctly.
+
+3. No Logger.warn() in Apps Script. The Apps Script Logger class only has .log().
+   The task asked for Logger.warn() but that method does not exist in the Apps Script
+   runtime. All warnings use Logger.log() with a "WARNING:" prefix instead.
+
+4. Token stored in Script Properties, not Secret Manager. Script Properties in
+   Apps Script are encrypted at rest by Google but are accessible to project owners.
+   For a true production secret store, Google Secret Manager would be appropriate —
+   but that requires an additional API call and setup complexity out of scope here.
+   Script Properties are documented as the standard Apps Script approach for secrets.
+
+5. Target schema is stable per tenant. The script fetches one target schema for all
+   emails in the run. If different clients need different target schemas, the
+   TARGET_SCHEMA_URL would need to become per-email metadata (parsed from subject
+   or looked up by client_name). This is deferred as a future enhancement.
+
+6. Only the first CSV attachment is used. If a sender attaches multiple CSVs,
+   only the first is sent as source_file. The /api/ingest endpoint accepts exactly
+   one source and one target file. Supporting multi-attachment emails (e.g., one
+   attachment = source, another = target) would require a naming convention or
+   ordering assumption — deferred.
+
+7. Trigger name. The Apps Script trigger API (ScriptApp.newTrigger) does not support
+   setting a display name. The handler function name "checkInbox" serves as the
+   identifier. The task asked for a trigger named "MigrateHQ Ingest" — this is not
+   possible with the Apps Script trigger API and is documented here.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- No live testing. The script was not executed against a real Gmail account or the
+  /api/ingest endpoint. It requires deployment to Apps Script to run.
+
+- Target schema per-client not supported. All emails use the same TARGET_SCHEMA_URL.
+  A multi-tenant deployment where each client maps to a different WMS template would
+  require extending the subject parsing and config to support per-client schema URLs.
+
+- Only the first CSV attachment is processed. Multi-attachment handling is not
+  implemented. If the email contains both source and target CSVs as attachments,
+  the script uses only the first as source and still fetches the configured target
+  schema — it does not attempt to use the second attachment as the target.
+
+- No deduplication. If the same email is somehow processed twice (e.g., mark-read
+  fails after a successful POST), the pipeline will be called again and create a
+  duplicate run. The /api/ingest endpoint has no idempotency key support.
+
+- Apps Script execution time limit. Google Apps Script functions time out after
+  6 minutes. The /api/ingest endpoint is synchronous and can take several minutes
+  for large CSVs running L1+L2 matching. If the pipeline exceeds ~5.5 minutes,
+  the Apps Script will time out before marking the email as read — causing a retry
+  on the next cycle even though the run may have completed on the server side.
+
+- AUTH_TOKEN not validated server-side. The /api/ingest endpoint reads the
+  Authorization header but does not validate it (no JWT middleware exists — see
+  CLAUDE.md Section 3). The token is sent correctly by this script but currently
+  has no effect on the server.
+
+- Logger severity levels don't exist. Apps Script Logger.log() has no warn/error
+  variants. All severity is expressed in the log message prefix. Cloud Logging
+  (via console.log in V8 runtime) supports severity but requires different setup.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. UrlFetchApp multipart Blob encoding: confirm that UrlFetchApp correctly names
+   the multipart fields 'source_file' and 'target_file' when Blob objects are
+   passed as payload values. FastAPI's File() parameter expects the MIME part name
+   to match the parameter name exactly. If Apps Script uses a different naming
+   convention (e.g., the blob's filename instead of the dict key), the endpoint
+   will return 422. Test with testApiConnection() first, then a real email.
+
+2. Apps Script execution timeout vs pipeline duration: run a test ingest with a
+   real-sized CSV (e.g., the Olist orders dataset, ~99k rows) via postToIngest()
+   and measure wall-clock time. If the pipeline regularly exceeds 5 minutes, the
+   Apps Script trigger will hit the 6-minute timeout. Mitigation: make /api/ingest
+   async (return a job_id, poll later) — but that requires a job queue not currently
+   in scope.
+
+3. Gmail label query with nested labels: test GmailApp.search() with the exact query
+   'label:"MigrateHQ/Ingest" is:unread' in your Gmail account. In some configurations,
+   Gmail treats "/" as a hierarchy separator and the label must be searched differently.
+   previewInbox() runs this exact query and logs the count — use it to verify before
+   running the full checkInbox().
+
+4. TARGET_SCHEMA_URL and Google Drive: if the target schema CSV is shared via a
+   Google Drive "Anyone with the link" share, the URL returned by Drive may be a
+   web preview URL, not a direct CSV download URL. UrlFetchApp.fetch() on a Drive
+   preview URL returns HTML, not CSV — the ingest endpoint will reject it with 400.
+   Use the direct download URL format:
+     https://drive.google.com/uc?export=download&id=<FILE_ID>
+   Confirm this returns Content-Type: text/csv before setting it as TARGET_SCHEMA_URL.

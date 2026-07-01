@@ -1,0 +1,181 @@
+TASK
+Add POST /api/ingest endpoint that accepts file uploads and triggers the schema-mapping
+pipeline, replacing the CLI-only invocation path.
+
+---
+
+FILES CHANGED
+
+1. backend/requirements.txt
+   Added three packages:
+     python-multipart>=0.0.20   — required by FastAPI to parse multipart/form-data (file uploads)
+     pandas>=2.0.0              — required by orchestrator_pipeline / orchestrator
+     valentine>=0.3.0           — required by orchestrator (L1 JaccardDistanceMatcher)
+   These were already present in the Homebrew system Python environment (which the
+   schema-mapping pipeline was previously run with) but absent from .venv-backend.
+   All three were installed into .venv-backend as part of this task.
+
+2. backend/main.py — imports section
+   Added:
+     import sys
+     import tempfile
+   Changed:
+     from fastapi import FastAPI, Header, HTTPException
+   To:
+     from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+   Added after existing imports:
+     _SCHEMA_MAPPING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "schema-mapping")
+     if _SCHEMA_MAPPING_DIR not in sys.path:
+         sys.path.insert(0, _SCHEMA_MAPPING_DIR)
+     from orchestrator_pipeline import run_mapping_pipeline
+     _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB per file
+
+3. backend/main.py — new endpoint
+   POST /api/ingest
+   Form inputs:
+     source_file   UploadFile   Customer's raw data CSV (the data to be mapped FROM)
+     target_file   UploadFile   WMS target schema CSV (the schema to be mapped TO)
+     client_name   str          Label stored as source_dataset in BigQuery and Supabase
+   Header:
+     X-Tenant      str          Tenant scoping, same as all other endpoints (default: migratehq)
+
+   Validation (before any disk write):
+     - Both filenames must end in .csv (400 if not)
+     - Neither file may be 0 bytes (400 if empty)
+     - Neither file may exceed 10 MB (413 if over)
+   File handling:
+     - Each upload is read into memory, validated, then written to a NamedTemporaryFile
+       (delete=False so the path is valid after close)
+     - Both temp files are deleted in a finally block regardless of pipeline outcome
+   Pipeline call:
+     run_mapping_pipeline(
+         source_csv_path=src_tmp,
+         target_csv_path=tgt_tmp,
+         dataset_name=client_name,
+         client_label=client_name,
+         tenant_name=tenant,
+     )
+   Response on success (mirrors shape of GET /api/clients/{client_name}/runs per-run row):
+     {
+         "run_id": str,
+         "created_at": str (ISO timestamp),
+         "total_columns": int,
+         "l1_count": int,
+         "l2_count": int,
+         "fallback_count": int,
+         "accuracy_pct": float,
+         "status": "completed"
+     }
+   Error responses:
+     400 — validation failure (non-CSV, empty file)
+     413 — file exceeds 10 MB
+     422 — pipeline returned status="error" (CSV parse failure, orchestrator failure)
+     500 — unexpected exception during pipeline execution
+
+---
+
+WHAT WAS BUILT
+
+The endpoint accepts two CSV uploads (source and target) plus a client_name form field.
+It saves both to OS temp files, calls run_mapping_pipeline() synchronously, cleans up
+temp files, and returns a run summary that matches the shape already returned by the
+existing runs history endpoint.
+
+The backend now imports orchestrator_pipeline at startup (not on first request), which
+means the WMS context file (schema-mapping/claude.md) is loaded once when uvicorn starts.
+
+The sys.path manipulation uses os.path.abspath(__file__) so it resolves correctly
+regardless of the working directory when uvicorn is launched.
+
+---
+
+HOW IT WAS TESTED
+
+Validation paths tested live against the running server:
+  1. Non-CSV target file → {"detail": "target_file: only CSV files are accepted"} ✓
+  2. Truly empty source file (0 bytes via truncate) → {"detail": "source_file is empty"} ✓
+  3. Server startup with new imports → health check returns 200, data_source: supabase ✓
+
+Full pipeline execution (source+target CSV → BigQuery+Supabase write) was NOT triggered
+during testing because doing so would write live data and consume L2 API quota. The
+pipeline call path is the same code path already proven working by prior Olist test runs.
+
+---
+
+ASSUMPTIONS MADE
+
+1. Two-file upload design. run_mapping_pipeline() requires both a source CSV and a target
+   CSV. Rather than hardcoding a server-side target schema or building a target-selection
+   mechanism, the endpoint accepts both as uploads. This makes the API honest about its
+   inputs and doesn't require the caller to know which manufactured CSV is on disk.
+   Future improvement: add a GET /api/targets endpoint that lists server-side WMS template
+   CSVs, and a target_dataset form field that references one by name.
+
+2. Synchronous execution. The endpoint blocks until the full pipeline completes. For large
+   datasets with many L2 escalations (each with a 1s sleep + Gemini round-trip), this
+   could hold the HTTP connection open for minutes. FastAPI runs sync def handlers in a
+   thread pool (via anyio), so this blocks one thread but not the event loop. For the
+   current pilot scale (dozens of columns, single concurrent user), this is acceptable.
+   When load increases, the right fix is an async job queue (e.g. Celery, ARQ) with a
+   POST /ingest → job_id, GET /ingest/{job_id}/status pattern. That was explicitly out
+   of scope for this task.
+
+3. Files read entirely into memory before writing to disk. This simplifies validation
+   (size check on bytes, not on the temp file) but means two copies of each file exist
+   briefly (in-memory + on disk). The 10 MB limit per file keeps this bounded.
+
+4. dataset_name and client_label both set to client_name. run_mapping_pipeline() uses
+   dataset_name as an annotation label in BigQuery notes ("pipeline:{dataset_name}") and
+   client_label as source_dataset in both stores. Using the same value for both keeps
+   the run identifiable and consistent with how existing test runs were labeled.
+
+5. 10 MB file size limit is a placeholder. The existing Olist test CSVs are 17 MB
+   (olist_orders_stage1_man.csv), which would be rejected by this limit. The limit is
+   intentionally conservative for an MVP API endpoint. It should be raised or made
+   configurable before this endpoint is used with real customer data at production scale.
+   Note: the stage1 manufactured CSV is anomalously large (full Olist dataset, not just
+   schema). Stage2 and stage3 manufactured CSVs are 17-18 KB and well under the limit.
+
+6. Temp directory is the OS default (tempfile.NamedTemporaryFile default). Files are
+   cleaned up immediately after the pipeline completes. There is no persistence of
+   uploaded files after the run.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- The 10 MB limit rejects the olist_orders_stage1_man.csv (16.7 MB) that the existing
+  test runs used as target. Stage2 and stage3 work fine. Raise the limit before using
+  with large real-world schemas.
+- No authentication on this endpoint. Any caller who can reach the server can trigger
+  a pipeline run (L2 calls Gemini, BQ writes cost money). Consistent with the general
+  lack of backend auth noted in CLAUDE.md.
+- The endpoint currently requires the target CSV to be uploaded on every call. If the
+  WMS target schema is fixed/reused across clients, callers must re-upload it each time.
+  A server-side target library would eliminate this.
+- Python 3.9 deprecation warnings appear at startup from google-auth, urllib3, etc.
+  These are warnings only and do not affect functionality, but indicate the Python version
+  used by .venv-backend should be upgraded.
+- No frontend upload UI exists yet (explicitly out of scope per task requirements).
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. The 10 MB file size limit will reject olist_orders_stage1_man.csv (16.7 MB) and any
+   real customer dataset larger than 10 MB. Before using /ingest with real data, confirm
+   what a realistic source CSV size is for a production client. Should _MAX_UPLOAD_BYTES
+   be raised (e.g. to 100 MB) or made a configurable env var?
+
+2. The endpoint is synchronous and blocks the HTTP connection for the duration of the
+   pipeline. For a dataset like Olist orders with ~10 columns and multiple L2 escalations
+   plus 1s sleeps, what is the expected runtime? If it regularly exceeds 60 seconds, the
+   connection will time out for most HTTP clients and proxies. Was the synchronous
+   decision correct, or should a job queue be scoped sooner than planned?
+
+3. The sys.path manipulation adds schema-mapping/ to sys.path at backend startup. This
+   means orchestrator_pipeline.py, orchestrator.py, bigquery_loader.py, and reasoner.py
+   are all importable from anywhere in the backend process. Check whether any existing
+   backend module names clash with schema-mapping module names (e.g. bigquery_loader in
+   schema-mapping vs bigquery_store in backend). Currently there is no clash, but adding
+   new modules to either directory without checking could cause silent import shadowing.

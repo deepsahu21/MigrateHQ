@@ -5,6 +5,13 @@ import ConfidenceBadge from '../components/ConfidenceBadge'
 import LayerBadge from '../components/LayerBadge'
 import { api, ApiClient, ApiMappingResult, ApiRunHistory } from '../lib/api'
 
+type ReviewStatus = 'pending_review' | 'approved' | 'rejected'
+
+interface ReviewActionState {
+  loading: boolean
+  error: boolean
+}
+
 interface ExplainState {
   text: string | null
   loading: boolean
@@ -31,6 +38,8 @@ export default function Clients({ session }: ClientsProps) {
   const [activeTab,      setActiveTab]      = useState<DetailTab>('mappings')
   const [expandedRow,    setExpandedRow]    = useState<string | null>(null)
   const [explanations,   setExplanations]   = useState<Record<string, ExplainState>>({})
+  const [reviewStatuses, setReviewStatuses] = useState<Record<string, ReviewStatus>>({})
+  const [reviewActions,  setReviewActions]  = useState<Record<string, ReviewActionState>>({})
 
   useEffect(() => {
     setLoadingList(true)
@@ -71,6 +80,30 @@ export default function Clients({ session }: ClientsProps) {
     }
   }
 
+  async function handleApprove(r: ApiMappingResult) {
+    const col = r.source_column
+    setReviewActions(prev => ({ ...prev, [col]: { loading: true, error: false } }))
+    try {
+      await api.approve(selectedClient!.client_name, col)
+      setReviewStatuses(prev => ({ ...prev, [col]: 'approved' }))
+      setReviewActions(prev => ({ ...prev, [col]: { loading: false, error: false } }))
+    } catch {
+      setReviewActions(prev => ({ ...prev, [col]: { loading: false, error: true } }))
+    }
+  }
+
+  async function handleReject(r: ApiMappingResult) {
+    const col = r.source_column
+    setReviewActions(prev => ({ ...prev, [col]: { loading: true, error: false } }))
+    try {
+      await api.reject(selectedClient!.client_name, col)
+      setReviewStatuses(prev => ({ ...prev, [col]: 'rejected' }))
+      setReviewActions(prev => ({ ...prev, [col]: { loading: false, error: false } }))
+    } catch {
+      setReviewActions(prev => ({ ...prev, [col]: { loading: false, error: true } }))
+    }
+  }
+
   function selectClient(c: ApiClient) {
     setSelectedClient(c)
     setMappings([])
@@ -78,18 +111,28 @@ export default function Clients({ session }: ClientsProps) {
     setDetailError(null)
     setExpandedRow(null)
     setExplanations({})
+    setReviewStatuses({})
+    setReviewActions({})
     setLoadingDetail(true)
     Promise.all([
       api.mappings(c.client_name),
       api.runs(c.client_name),
     ])
-      .then(([m, r]) => { setMappings(m); setRunHistory(r) })
+      .then(([m, r]) => {
+        setMappings(m)
+        setRunHistory(r)
+        const statuses: Record<string, ReviewStatus> = {}
+        m.forEach(mapping => { statuses[mapping.source_column] = mapping.status })
+        setReviewStatuses(statuses)
+      })
       .catch((e: Error) => setDetailError(e.message))
       .finally(() => setLoadingDetail(false))
   }
 
   const isAdmin = session.role === 'admin'
-  const reviewQueue = mappings.filter((r) => r.confidence < 0.75)
+  const reviewQueue = mappings.filter((r) =>
+    (reviewStatuses[r.source_column] ?? r.status ?? (r.confidence < 0.75 ? 'pending_review' : 'approved')) === 'pending_review'
+  )
 
   if (loadingList) {
     return (
@@ -352,9 +395,26 @@ export default function Clients({ session }: ClientsProps) {
                                   <td><LayerBadge layer={r.layer} /></td>
                                   <td>
                                     <div className="review-actions" onClick={e => e.stopPropagation()}>
-                                      <button className="btn btn-approve">Approve</button>
-                                      <button className="btn btn-override">Override</button>
+                                      <button
+                                        className="btn btn-approve"
+                                        disabled={reviewActions[r.source_column]?.loading}
+                                        onClick={() => handleApprove(r)}
+                                      >
+                                        {reviewActions[r.source_column]?.loading ? '…' : 'Approve'}
+                                      </button>
+                                      <button
+                                        className="btn btn-override"
+                                        disabled={reviewActions[r.source_column]?.loading}
+                                        onClick={() => handleReject(r)}
+                                      >
+                                        {reviewActions[r.source_column]?.loading ? '…' : 'Override'}
+                                      </button>
                                     </div>
+                                    {reviewActions[r.source_column]?.error && (
+                                      <div style={{ color: 'var(--red-text)', fontSize: '0.7rem', marginTop: 2 }}>
+                                        Action failed
+                                      </div>
+                                    )}
                                   </td>
                                   <td className="queue-chevron-cell">
                                     <ChevronDown

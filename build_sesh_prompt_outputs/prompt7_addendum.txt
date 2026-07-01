@@ -1,0 +1,25 @@
+ADDENDUM to prompt7 — Remove Accuracy stat from Upload success view
+
+FILES CHANGED
+
+frontend/src/pages/Upload.tsx
+  Removed the Accuracy stat cell from SuccessView. The cell rendered
+  result.accuracy_pct with color-coded thresholds (green/amber/red).
+  Removed the entire <div className="upload-result-stat"> block for
+  Accuracy, including the accuracy_pct.toFixed(1) display and the
+  color-coding inline style.
+
+frontend/src/index.css
+  Changed .upload-result-grid grid-template-columns from repeat(5, 1fr)
+  to repeat(4, 1fr) to fill the row evenly with the remaining four cells.
+
+REASON
+  The `correct` field in mapping_results is never populated by the pipeline
+  (always null). accuracy_pct is therefore always 0 or null, so displaying
+  it in the result view was misleading rather than informative.
+
+REMAINING STATS (unchanged)
+  Total Columns, L1 Matches, L2 Matches, Fallback.
+
+VERIFIED
+  `npx tsc --noEmit` → No errors found.

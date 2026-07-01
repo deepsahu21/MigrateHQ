@@ -28,6 +28,7 @@ def run_mapping_pipeline(
     source_csv_kwargs: dict = None,
     target_csv_kwargs: dict = None,
     client_label: str = None,
+    tenant_name: str = "olist",
 ) -> dict:
     """
     Load two CSVs, run L1→L2 schema mapping, push results to BigQuery.
@@ -111,6 +112,7 @@ def run_mapping_pipeline(
         source_dataset=source_label,
         run_id=run_id,
         run_timestamp=datetime.now(timezone.utc).isoformat(),
+        tenant_name=tenant_name,
     )
 
     logger.info(

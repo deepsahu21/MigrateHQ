@@ -1,0 +1,226 @@
+TASK
+Add a real confidence-gated review state to mapping_results, build approve/reject
+endpoints, wire the dead UI buttons to them, and gate the BigQuery write so only
+approved records reach it.
+
+---
+
+FILES CHANGED
+
+1. backend/schema.sql
+   Added to mapping_results CREATE TABLE:
+     status TEXT NOT NULL DEFAULT 'pending_review'
+       CHECK (status IN ('pending_review', 'approved', 'rejected'))
+   Added idempotent ALTER TABLE for existing deployments:
+     ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_review'
+       CHECK (status IN ('pending_review', 'approved', 'rejected'));
+
+2. schema-mapping/bigquery_loader.py — push_mapping_to_bigquery()
+   BEFORE: result_rows included all columns unconditionally.
+   AFTER:  result_rows filtered to only include records where confidence >= 0.75.
+     if (info.get("confidence") or 0.0) >= 0.75   ← added as list comprehension condition
+   The mapping_runs row (counts, totals) is unaffected — it still reflects the full run.
+
+3. schema-mapping/bigquery_loader.py — write_to_supabase()
+   BEFORE: no status field in inserted rows.
+   AFTER:  status field added per row:
+     "status": "approved" if (info.get("confidence") or 0.0) >= 0.75 else "pending_review"
+
+4. backend/bigquery_store.py
+   NEW import: from datetime import datetime, timezone
+   NEW function:
+     def push_approved_result(row: dict) -> None
+       Writes a single mapping_result row to BigQuery RESULTS_TABLE.
+       Converts the Supabase row dict to the BQ schema (run_id, source_column,
+       target_column, confidence, layer, correct, run_timestamp).
+       Uses WRITE_APPEND disposition. Called by the approve endpoint only when
+       the row's previous status was 'pending_review'.
+
+5. backend/main.py — GET /api/clients/{client_name}/mappings
+   BEFORE: .select("source_column, target_column, confidence, layer, correct, flagged_for_review")
+   AFTER:  .select("source_column, target_column, confidence, layer, correct, flagged_for_review, status")
+   Return dict now includes: "status": r.get("status", "pending_review")
+
+6. backend/main.py — NEW endpoints
+   POST /api/clients/{client_name}/mappings/{source_column}/approve
+     - 503 if USE_BIGQUERY mode (no Supabase to update)
+     - 403 if tenant doesn't match client_name
+     - 404 if client/run/row not found
+     - Updates status to 'approved' in Supabase
+     - Calls bigquery_store.push_approved_result() ONLY if previous status was
+       'pending_review' (prevents duplicate BQ writes for already-approved rows)
+     - BQ write failure is non-fatal: logs warning, returns bq_written: false
+     - Returns: {"source_column": str, "status": "approved", "bq_written": bool}
+
+   POST /api/clients/{client_name}/mappings/{source_column}/reject
+     - Same guards (503, 403, 404)
+     - Updates status to 'rejected' in Supabase only (rejected records never go to BQ)
+     - Returns: {"source_column": str, "status": "rejected"}
+
+7. frontend/src/lib/api.ts
+   ApiMappingResult: added status: 'pending_review' | 'approved' | 'rejected'
+   New interface ApiReviewAction: { source_column: string; status: 'approved'|'rejected'; bq_written?: boolean }
+   New api methods:
+     approve(clientName, sourceColumn) → POST .../approve → ApiReviewAction
+     reject(clientName, sourceColumn)  → POST .../reject  → ApiReviewAction
+
+8. frontend/src/pages/Clients.tsx
+   New type: ReviewStatus = 'pending_review' | 'approved' | 'rejected'
+   New interface: ReviewActionState { loading: boolean; error: boolean }
+   New state:
+     reviewStatuses: Record<string, ReviewStatus>  — local status overrides per column
+     reviewActions:  Record<string, ReviewActionState>  — loading/error per in-flight action
+   Initialised from mapping.status on data load; reset to {} on client switch.
+   New handlers:
+     handleApprove(r): sets loading, calls api.approve(), sets reviewStatuses[col]='approved'
+     handleReject(r):  sets loading, calls api.reject(),  sets reviewStatuses[col]='rejected'
+   Review queue filter changed:
+     BEFORE: mappings.filter(r => r.confidence < 0.75)
+     AFTER:  mappings.filter(r =>
+               (reviewStatuses[r.source_column] ?? r.status ?? (r.confidence < 0.75 ? 'pending_review' : 'approved'))
+               === 'pending_review'
+             )
+   Approve/Override buttons now have:
+     - onClick: handleApprove / handleReject
+     - disabled: while reviewActions[col].loading is true
+     - label: shows '…' while loading, reverts to 'Approve'/'Override'
+     - error display: "Action failed" below buttons if reviewActions[col].error is true
+
+---
+
+WHAT WAS BUILT
+
+**Confidence-gated write path (the core of this task):**
+When the pipeline runs, push_mapping_to_bigquery() now filters its result rows to only
+those with confidence >= 0.75. Low-confidence records (the ones flagged for review) are
+NOT written to BigQuery during the pipeline run — they land in Supabase only with
+status='pending_review'. High-confidence records get status='approved' in Supabase and
+are also written to BigQuery as before. The mapping_runs row (which records counts and
+totals) is still written for the full run — it reflects the complete pipeline output,
+not just the approved subset.
+
+**Approve flow:**
+When a human clicks Approve in the Review Queue, the frontend calls POST /approve. The
+backend updates status to 'approved' in Supabase and then — because this is a record that
+was held back at pipeline time — writes it to BigQuery for the first time. The check
+`was_pending = row.get("status") == "pending_review"` gates the BQ write so that
+re-approving an already-approved record (which shouldn't occur via normal UI flow but
+could via direct API call) doesn't create a duplicate BQ row. BQ write failure is
+non-fatal: the status update in Supabase is committed, and bq_written: false is returned
+so the caller knows.
+
+**Reject flow:**
+Clicking Override calls POST /reject, which sets status='rejected'. No BQ write occurs.
+Rejected records stay in Supabase for audit purposes but never reach BigQuery.
+
+**UI behavior:**
+On Approve or Override, the row immediately disappears from the Review Queue tab without
+a page refresh (the queue filter uses the local reviewStatuses override). Buttons show
+'…' while the request is in flight and are disabled to prevent double-submission. An
+"Action failed" message appears inline if the request errors.
+
+**flagged_for_review relationship:**
+flagged_for_review was NOT removed. It is now partially redundant: every row with
+flagged_for_review=true will have status='pending_review' or 'rejected'. But they are
+not equivalent: status tracks the human decision; flagged_for_review tracks only whether
+confidence was below 0.75 at write time. They serve different purposes and both remain.
+
+---
+
+HOW IT WAS TESTED
+
+Not integration-tested against a live Supabase or BigQuery instance. Verified by:
+- Grep checks confirming the 0.75 filter appears in push_mapping_to_bigquery()
+- Grep checks confirming status field appears in write_to_supabase() rows
+- Grep checks confirming /approve and /reject endpoints exist in main.py
+- Grep checks confirming reviewStatuses, handleApprove, handleReject, onClick wiring
+  appear in Clients.tsx
+- Visual inspection of the Clients.tsx queue filter logic
+
+No unit tests added (none exist in this repo for the backend or frontend).
+
+To manually test:
+1. Run the pipeline on a dataset — confirm BigQuery mapping_results only has rows with
+   confidence >= 0.75; confirm Supabase has all rows, with correct status values.
+2. Open the Review Queue tab in the frontend, click Approve on a row — confirm the row
+   disappears from the queue immediately, and the BigQuery results table gains the row.
+3. Click Override — confirm the row disappears from the queue and does NOT appear in BQ.
+
+---
+
+ASSUMPTIONS MADE
+
+1. Auto-approve threshold = 0.75 (not 0.8). The task specified confidence >= 0.75 should
+   auto-approve. The L1 threshold (0.8) is a separate concept — it controls when L1 is
+   accepted vs escalated to L2. The 0.75 flagging threshold is the right cutoff for the
+   review gate. Records with confidence 0.75–0.80 are L2-resolved but still approved
+   automatically.
+
+2. BQ write failure during /approve is non-fatal. Rationale: the approval is the human
+   decision (stored in Supabase). A transient BQ connectivity issue should not force the
+   reviewer to re-do the decision. The bq_written field in the response lets the caller
+   detect and retry if needed. Alternative (fail the whole /approve on BQ error) was
+   rejected as too disruptive for an MVP.
+
+3. Rejected records are never written to BQ, even if later re-approved. Currently there
+   is no re-approve flow (the UI removes the row from the queue on any action). If the
+   intended behavior is that a rejected→re-approved flow should exist, the /approve
+   endpoint already supports it (was_pending check also fires if status was 'rejected'),
+   but the UI doesn't surface it.
+
+4. Existing rows in Supabase will get status='pending_review' from the ALTER TABLE
+   default. This means all historical high-confidence rows will appear as pending_review
+   in Supabase after the migration, even though they were already written to BigQuery.
+   There is no automatic backfill to set them to 'approved'. This is a limitation of
+   using ALTER TABLE default — a one-time UPDATE would be needed:
+     UPDATE mapping_results SET status = 'approved' WHERE confidence >= 0.75;
+   This was NOT run as part of this task.
+
+5. The review queue filter in the frontend falls back to confidence < 0.75 if status is
+   null/undefined (before migration), so the UI degrades gracefully on un-migrated data.
+
+6. USE_BIGQUERY mode returns 503 for approve/reject. The review workflow is designed
+   around Supabase row updates. BigQuery is append-only and doesn't support UPDATE.
+   Building a separate BQ-only review path was out of scope.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- Existing Supabase rows need a one-time backfill: UPDATE mapping_results SET status =
+  'approved' WHERE confidence >= 0.75; This file documents the need but does not run it.
+- If a BQ write succeeds during /approve but the Supabase update then fails (extremely
+  unlikely but theoretically possible), the row is in BQ but still shows as
+  pending_review in Supabase. No rollback mechanism exists.
+- Rejected records have no re-review path in the UI — they disappear from the queue
+  permanently. Only possible via direct API call.
+- The approve/reject endpoints scope by the client's latest run only (same as /mappings
+  and /explain). If you want to review a mapping from an older run, there is no path.
+- bigquery_store.push_approved_result() uses datetime.now() for run_timestamp, not the
+  original run's timestamp. The BQ results table will show the approval time, not the
+  pipeline run time, for human-approved records.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. After running the ALTER TABLE to add the status column, existing high-confidence rows
+   in Supabase will have status='pending_review' (the default), even though they were
+   already written to BigQuery. If you query Supabase for pending_review rows, you will
+   see a large number that are actually already in BQ. Should a one-time backfill be
+   run (UPDATE mapping_results SET status='approved' WHERE confidence >= 0.75) before
+   this goes live? Without it, the Review Queue in the UI will initially show all
+   historical high-confidence rows as needing review.
+
+2. The BQ gate filters by confidence >= 0.75 at pipeline time. This means for the SAME
+   run, the mapping_runs row in BigQuery will show (e.g.) total_columns=10, l1_count=7,
+   l2_count=2, fallback_count=1 — but the mapping_results table will only have the 8
+   rows with confidence >= 0.75. Is this acceptable? A query joining the two tables will
+   find missing result rows for the low-confidence records until they are approved.
+
+3. push_approved_result() in bigquery_store.py uses datetime.now(UTC) as the
+   run_timestamp for the newly written BQ row — not the timestamp from the original
+   pipeline run. This means for a human-approved record, its run_timestamp in BigQuery
+   will be the approval time (days or weeks after the pipeline ran), not the pipeline
+   execution time. Does this matter for any downstream queries or dashboards that use
+   run_timestamp to correlate results?

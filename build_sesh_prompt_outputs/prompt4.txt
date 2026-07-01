@@ -1,0 +1,200 @@
+TASK
+Wire the batched L2 semantic matching (mutual exclusion across multiple columns) into the
+production orchestrator.py, replacing the current single-column sequential approach.
+
+---
+
+FILES CHANGED
+
+1. schema-mapping/orchestrator.py — import
+   BEFORE: from layer2_claude.reasoner import reason_best_match
+   AFTER:  from layer2_claude.reasoner import semantic_match_batch
+
+2. schema-mapping/orchestrator.py — module docstring
+   Updated line: "single LLM call per column" → "one LLM call per group with full
+   mutual-exclusion reasoning across the group"
+
+3. schema-mapping/orchestrator.py — new module-level helpers (added after L1_THRESHOLD)
+
+   def _group_by_category(cols: list) -> dict:
+     Splits each column name on _, -, space; tests tokens against three word sets:
+       date_words   = {"date","time","ts","at","timestamp","dt","day","when"}
+       id_words     = {"id","ref","code","num","number","key","uuid"}
+       status_words = {"status","state","stage","type","flag","mode"}
+     Returns dict with up to 4 keys: "timestamps", "identifiers", "status", "other".
+     Empty groups are omitted. Priority is in that order (a column matching both
+     date_words and id_words goes to timestamps).
+
+   def _apply_l1_fallback(src, src_sample_list, candidates, claimed_targets, target_df, final_mapping):
+     Writes the best unclaimed L1 candidate for src as layer="L1-fallback", or
+     layer="none" if no unclaimed candidates remain. Mutates claimed_targets and
+     final_mapping in place. Extracted from the repeated fallback block that existed
+     twice in the old sequential loop.
+
+4. schema-mapping/orchestrator.py — L2 section (full replacement)
+   BEFORE: per-column loop over `escalate`, one reason_best_match() call per column,
+           1-second sleep between every call, inline L1-fallback block duplicated.
+   AFTER:
+     batch_groups = _group_by_category(escalate)
+     for batch_name, src_group in batch_groups.items():
+         available_targets = [t for t in target_cols if t not in claimed_targets]
+         # if no targets: mark all src_group as "none"
+         src_samples = {src: source_df[src]...head(5).tolist() for src in src_group}
+         tgt_samples = {t: target_df[t]...head(5).tolist() for t in available_targets}
+         time.sleep(1)
+         matches = semantic_match_batch(batch_name, src_group, available_targets,
+                                        src_samples, tgt_samples)
+         # resolve each match; fall back to L1 if null/claimed; apply fallback for
+         # any columns the model omitted entirely
+
+   reasoner.py was NOT modified. reason_best_match() still exists there for backward
+   compatibility with anything that calls it directly.
+
+---
+
+WHAT WAS BUILT
+
+The L2 escalation path in orchestrator.py now works as follows:
+
+1. After L1, all low-confidence source columns are collected into `escalate` (unchanged).
+2. `_group_by_category()` buckets them by semantic type: timestamp-related columns
+   (date, time, ts, at, etc.) → "timestamps"; id-related columns → "identifiers";
+   status-related → "status"; everything else → "other".
+3. For each non-empty group, ONE call to `semantic_match_batch()` is made, passing all
+   columns in the group + all currently unclaimed target columns + sample values.
+   The model sees the full group and applies mutual-exclusion: it cannot assign the same
+   target to two source columns in the group.
+4. Results are processed in order; `claimed_targets` is updated after each match so
+   subsequent batches cannot claim the same target.
+5. If the model returns null, a target that's already claimed, or omits a column
+   entirely, `_apply_l1_fallback()` assigns the best unclaimed L1 candidate for that
+   column (or "none" if none remain).
+
+For the Olist stage2 dataset (8 columns, all escalated to L2):
+  OLD: 8 Gemini calls, 8 sleeps
+  NEW: 3 Gemini calls (timestamps=5 cols, identifiers=2, status=1), 3 sleeps
+
+  Grouping produced:
+    timestamps: [order_purchase_timestamp, order_approved_at,
+                 order_delivered_carrier_date, order_delivered_customer_date,
+                 order_estimated_delivery_date]
+    identifiers: [order_id, customer_id]
+    status: [order_status]
+
+  Note: test_stage2.py uses 4 manually-crafted batches (splitting delivery-dates out
+  from timestamps). The orchestrator's 3 auto-grouped batches are coarser but valid —
+  all 5 date columns + all unclaimed targets go to one Gemini call, and the model is
+  expected to resolve mutual exclusion among them. Whether this produces equal accuracy
+  to the hand-tuned 4-batch split is noted under Known Limitations.
+
+---
+
+HOW IT WAS TESTED
+
+1. Import smoke test — confirmed module loads cleanly:
+   from orchestrator import run_orchestrator, _group_by_category
+   → no errors
+
+2. Grouping logic verified against Olist stage2 columns:
+   _group_by_category([
+     'order_id', 'customer_id', 'order_status',
+     'order_purchase_timestamp', 'order_approved_at',
+     'order_delivered_carrier_date', 'order_delivered_customer_date',
+     'order_estimated_delivery_date',
+   ])
+   Output:
+     timestamps: [order_purchase_timestamp, order_approved_at,
+                  order_delivered_carrier_date, order_delivered_customer_date,
+                  order_estimated_delivery_date]
+     identifiers: [order_id, customer_id]
+     status: [order_status]
+   ✓ All 8 columns bucketed; no "other" group; matches expected semantic categories.
+
+3. Confirmed reason_best_match is absent from orchestrator's namespace:
+   dir(orchestrator) does not contain 'reason_best_match'. ✓
+
+4. Full end-to-end pipeline run was NOT triggered during testing (would make live
+   Gemini calls and write to BigQuery/Supabase). The grouping, import, and structural
+   logic were verified; the Gemini interaction path is the same code path already
+   proven working in test_stage2.py.
+
+---
+
+ASSUMPTIONS MADE
+
+1. All unclaimed targets are passed to each batch (not pre-filtered by category).
+   test_stage2.py pre-filters target columns per batch (e.g. only date target columns
+   sent with date source columns). The orchestrator sends ALL unclaimed targets to every
+   batch. Rationale: for arbitrary unknown schemas, we can't reliably categorize target
+   columns the same way we categorize source columns. Sending all targets is safer and
+   lets the model choose the best match from the full available set. The trade-off is
+   a larger prompt per batch.
+
+2. Grouping by 4 categories is coarser than the hand-tuned BATCHES in test_stage2.py.
+   test_stage2 splits date columns into "delivery-dates" (2 cols) and "timestamps"
+   (3 cols) to focus mutual-exclusion reasoning more tightly. The orchestrator puts all
+   5 date columns together. This is acceptable for a general-purpose pipeline; the model
+   is capable of resolving mutual exclusion among 5 date columns in one call.
+
+3. Sleep is kept between batches (not removed). Batches are still sent sequentially
+   (batch 1 completes before batch 2 starts), so the 1-second sleep still serves as
+   rate-limiting between calls. Removing the sleep would only be safe if all batches
+   were sent concurrently, which would require async handling not in scope here.
+
+4. A batch receives target samples for ALL unclaimed targets at call time. This means
+   if batch 1 (identifiers) claims a target, batch 2 (timestamps) will NOT see that
+   target in its candidates — which is correct and preserves one-to-one assignment.
+
+5. If the model returns a source column name that doesn't match any column in the
+   current batch (hallucination), it is silently skipped (with a comment in the code).
+   The column will then be caught by the "model omitted this column" safety path and
+   given an L1-fallback.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- The coarser grouping (5 date columns in one batch vs test_stage2's 2+3 split) may
+  perform slightly worse on the delivery-date disambiguation task, since the model must
+  now reason about 5 date columns simultaneously instead of 2. Accuracy should be
+  verified against test_stage2 ground truth with an actual pipeline run.
+
+- Columns with ambiguous names that don't contain any known word tokens will fall into
+  the "other" bucket together. If all such columns happen to compete for the same
+  target, mutual exclusion within "other" still applies. But "other" columns from
+  very different semantic domains (e.g. a price column and a count column) will be
+  sent together, which may confuse the model with an unfocused prompt. A future
+  improvement would be to sub-batch "other" by size (max N columns per call).
+
+- reason_best_match() remains in reasoner.py for backward compatibility but is no
+  longer called by the orchestrator. It can be removed in a future cleanup pass once
+  confirmed nothing else calls it.
+
+- No concurrent/parallel batch execution. Batches run sequentially with 1-second sleeps
+  between them. True parallelism would require async Gemini calls or a thread pool,
+  which was out of scope.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. The grouping puts all 5 Olist date columns into a single "timestamps" batch, while
+   test_stage2.py uses 4 separate batches (including a focused "delivery-dates" batch
+   of just 2 columns). Run the updated orchestrator against the stage2 dataset and
+   compare the per-column accuracy to the test_stage2 baseline. Did the coarser
+   grouping maintain the same accuracy, or did it miss the delivery-date disambiguation
+   (carrier_handoff_ts vs last_mile_completion_dt)?
+
+2. The "other" bucket will collect all escalated columns that don't match timestamp,
+   identifier, or status patterns. For a real customer schema with custom column naming
+   conventions (no underscores, abbreviated names, domain-specific terms), many columns
+   may land in "other" and be sent together in one large prompt. Is there a maximum
+   number of columns per batch that should be enforced before the prompt becomes too
+   large for reliable model reasoning?
+
+3. The 1-second sleep between batches is inherited from the original per-column sleep.
+   For a dataset where all escalated columns group into one batch (e.g., 10 columns all
+   fall into "other"), there will now be only 1 sleep instead of 10, reducing wall-clock
+   time significantly. Confirm the Gemini rate limits for gemini-2.5-flash are not
+   exceeded when batches go out more quickly — the retry logic in semantic_match_batch()
+   handles 429s, but sustained 429s will stall the pipeline.

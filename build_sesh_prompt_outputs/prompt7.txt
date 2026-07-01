@@ -1,0 +1,220 @@
+TASK
+Build a frontend upload UI that lets a user trigger a pipeline run through
+POST /api/ingest, instead of only being reachable via curl/API.
+
+---
+
+FILES CHANGED
+
+1. frontend/src/pages/Upload.tsx — new file
+   New page component. Two file inputs + client_name text input + submit.
+   Shows a running state while the request is in flight, a result view on
+   success, and an error block on failure.
+
+2. frontend/src/lib/api.ts — 3 additions
+   a) New helper: apiPostForm<T>(path, FormData)
+      Sends a multipart/form-data POST. Does NOT set Content-Type — the
+      browser must set it with the boundary string. Extracts FastAPI's
+      "detail" field from JSON error bodies for human-readable error messages.
+   b) New api.ingest(form: FormData) method calling apiPostForm.
+   c) New ApiIngestResult interface:
+        run_id, created_at, total_columns, l1_count, l2_count,
+        fallback_count, accuracy_pct, status
+
+3. frontend/src/components/Sidebar.tsx — 2 changes
+   - Added `Upload` to the lucide-react import list.
+   - Added { to: '/upload', label: 'Upload', icon: Upload } to NAV_ITEMS,
+     between Clients and Analytics.
+
+4. frontend/src/App.tsx — 2 changes
+   - Imported Upload page.
+   - Added <Route path="/upload" element={<Upload session={session} />} />
+     inside the protected shell, alongside the other routes.
+
+5. frontend/src/index.css — upload section appended (~130 lines)
+   New classes: upload-card, upload-card-header, upload-card-title,
+   upload-form, upload-field, upload-label, upload-label-hint,
+   upload-input, upload-file-input, upload-warning,
+   upload-error, upload-error-title, upload-error-body,
+   upload-actions, upload-hint,
+   upload-running, upload-running-title, upload-running-sub,
+   upload-result, upload-result-header, upload-result-badge,
+   upload-result-runid, upload-result-grid, upload-result-stat,
+   upload-result-value, upload-result-label, upload-result-actions,
+   upload-btn-secondary.
+
+---
+
+WHAT WAS BUILT
+
+A new "Upload" page accessible from the sidebar (between Clients and Analytics).
+
+FORM (pre-submit state):
+- Client name text input (required, checked before enabling submit)
+- Source CSV file input (required, filters to .csv in the file picker)
+- Target schema CSV file input (required, filters to .csv in the file picker)
+- If either file doesn't end in .csv, a yellow warning is shown below
+  the input (warning, not a block — backend is the real gate)
+- Submit button is disabled until all three fields are filled
+- Hint text explains what is missing (no generic "fill all fields" — it
+  says specifically which field is empty)
+
+LOADING STATE (during request):
+- Form is replaced by a full-card spinner + "Running pipeline…" message
+  and a sub-line "This may take several minutes. Do not close this page."
+- This is the same .spinner class used elsewhere, making it consistent
+- The loading state is a full card replacement (not just a disabled button)
+  so the user knows unambiguously that work is in progress
+
+ERROR STATE:
+- Shows the raw error string thrown by apiPostForm, which includes the
+  HTTP status code and the extracted FastAPI "detail" field
+- e.g. "422: Pipeline error: L1 threshold too high for this dataset"
+- Displayed in a red box with monospace body text (consistent with
+  .error-message elsewhere)
+- Error does not replace the form — it appears above the submit button
+  so the user can correct the issue and re-submit without re-filling fields
+
+SUCCESS STATE:
+- Form is replaced by a result card showing:
+    Run ID (truncated hex, full value shown)
+    5 stat cells: Total Columns, L1 Matches, L2 Matches, Fallback, Accuracy
+  Accuracy cell is color-coded green/amber/red using the same thresholds
+  used in Clients.tsx and Overview.tsx (≥90% green, ≥70% amber, <70% red)
+- Two action buttons:
+    "View mappings for <clientName>" → navigates to /clients
+    "Upload another" → resets the form to empty state in-place
+
+POST-SUCCESS NAVIGATION DECISION:
+  Chose "show result inline with a link to Clients page" rather than
+  auto-navigating. Reasoning:
+  1. The user should see the accuracy/column counts before navigating —
+     this tells them whether the run looks correct.
+  2. Auto-navigating discards the run_id from view, making it harder to
+     reference if something looks wrong in the client detail.
+  3. Some users may want to immediately upload another dataset.
+  The "View mappings" button navigates to /clients, where the user can
+  then select the newly-created client from the list.
+  Limitation: the button navigates to /clients without pre-selecting the
+  new client. The client list selects the first entry by default, which
+  may not be the newly-created one. A future improvement: pass
+  ?client=<clientName> as a query param and have Clients.tsx auto-select.
+
+TENANT SCOPING:
+  Uses the standard buildHeaders() in apiPostForm — X-Tenant is set from
+  session.tenant automatically, identical to every other API call.
+  The component receives the session prop but does not read it directly
+  (marked _session to indicate intentional non-use). Tenant scoping is
+  handled entirely by api.ts.
+
+---
+
+HOW IT WAS TESTED
+
+1. TypeScript: `npx tsc --noEmit` → "No errors found" ✓
+2. Production build: `npx vite build` → clean, 0 errors, 204 kB JS bundle ✓
+3. Live UI was NOT tested (backend not started during this session).
+   The form logic, loading/error/success state transitions, and API call
+   wiring were verified by code inspection.
+
+Key code paths inspected:
+- canSubmit gate: requires sourceFile !== null, targetFile !== null,
+  clientName.trim() !== '', and !loading. All four must be true.
+- FormData construction: source_file, target_file, client_name match
+  exactly what /api/ingest expects (FastAPI File() and Form() params).
+- apiPostForm: does NOT set Content-Type header — lets browser set
+  multipart/form-data with boundary automatically.
+- Error extraction: JSON.parse() attempted on error body; if json.detail
+  exists, uses that string; otherwise uses raw text. Wrapped in try/catch
+  so a non-JSON body (e.g. from a 413 or 500) uses the raw text.
+
+---
+
+ASSUMPTIONS MADE
+
+1. /clients route auto-selects first client. The "View mappings for X"
+   button navigates to /clients without query params. Clients.tsx selects
+   the first client in the list by default. If the new client is not first
+   (because it's sorted by last_run_at descending and an older client was
+   recently viewed), the user will need to manually select it. Acceptable
+   for MVP — noted as a known limitation.
+
+2. session prop is not used directly in Upload.tsx. The session is passed
+   for consistency with other protected-route pages (Overview, Clients)
+   and for potential future use (e.g. showing the tenant in the UI). It
+   is marked _session to silence the unused-variable lint warning.
+
+3. File picker filter (.csv) is advisory, not enforced. The <input
+   accept=".csv,text/csv"> attribute filters the file picker dialog but
+   does not prevent a user from typing a path to a non-CSV file in some
+   browsers. The csvWarning() function adds a UI warning, and the backend
+   is the real gate (returns 400 for non-CSV files).
+
+4. No file size display. The form doesn't show the selected filename or
+   size (just the browser's default file input label). This is consistent
+   with the "plain file inputs" constraint and leaves room for improvement.
+
+5. Error display in-form (not full-page). Errors appear inside the form
+   card above the submit button, not as a full-page error state. This lets
+   the user correct and retry without re-filling all fields. This is
+   different from the Clients/Overview pattern (which shows full-page
+   errors) because those are load errors — here the form itself is still
+   functional.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- No auto-select on Clients page after successful upload. The "View
+  mappings" button navigates to /clients but doesn't pre-select the
+  newly uploaded client. Future: add ?client=<name> query param support
+  to Clients.tsx.
+
+- No upload progress indicator. The file is buffered entirely in memory
+  before the fetch() call. For very large CSVs (≤500 MB), the user sees
+  the "Running pipeline…" spinner with no byte-count progress. Streaming
+  upload progress would require XMLHttpRequest instead of fetch().
+
+- No abort/cancel button during pipeline run. Once the user hits submit
+  and the fetch is in flight, there's no way to cancel without closing
+  the tab. The backend continues running even if the frontend disconnects.
+
+- Accuracy in result is raw from the API (no ground truth). The pipeline
+  writes accuracy_pct based on the `correct` field in mapping_results,
+  which is always null (CLAUDE.md "Known Gaps"). The success view will
+  always show accuracy_pct as returned by the API — which may be 0 or null
+  if no ground truth was provided.
+
+- No run history link from the result. After a successful upload, the
+  result view shows a "View mappings" button but not a direct link to
+  the Run History tab for this specific run. The run_id is displayed but
+  not clickable.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. FormData field names: confirm that FastAPI's /api/ingest expects the
+   exact parameter names 'source_file', 'target_file', and 'client_name'
+   (as defined in the File() and Form() decorators). If the parameter
+   names differ, the browser will send the right multipart parts but
+   FastAPI will return 422 "field required". Verify by checking the
+   current backend/main.py /api/ingest signature.
+
+2. Content-Type header: apiPostForm explicitly omits Content-Type from
+   the fetch() call so the browser sets it automatically with the
+   multipart boundary. If buildHeaders() ever returns a Content-Type
+   override in the future, it will break multipart parsing on the backend.
+   Confirm buildHeaders() never returns Content-Type (currently it only
+   returns X-Tenant and optionally Authorization).
+
+3. Accuracy display on success: if accuracy_pct is returned as null or 0
+   by the backend (because the `correct` field is always null), the
+   success view will show "0.0%" in red. Is this acceptable for the demo,
+   or should the accuracy cell be hidden when ground truth is unavailable?
+
+4. Client pre-selection after upload: in a demo with multiple clients,
+   navigating to /clients after upload will show the first client in the
+   list, not necessarily the newly uploaded one. Confirm whether this UX
+   is acceptable or whether Clients.tsx should be extended to support
+   a ?client= query param.

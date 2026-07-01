@@ -1,0 +1,142 @@
+TASK
+Fix schema drift and hardcoded tenant in the data write path. Two issues:
+(1) backend/schema.sql missing three columns that application code already reads/writes.
+(2) write_to_supabase() in bigquery_loader.py hardcodes tenant='olist', silently failing for any other tenant.
+
+---
+
+FILES CHANGED
+
+1. backend/schema.sql
+   — Added three columns to the mapping_results CREATE TABLE definition:
+       source_samples JSONB,
+       target_samples JSONB,
+       explanation TEXT
+   — Added three idempotent ALTER TABLE statements below the INSERT block for applying
+     the columns to existing Supabase deployments without recreating the table:
+       ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS source_samples JSONB;
+       ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS target_samples JSONB;
+       ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS explanation TEXT;
+
+2. schema-mapping/bigquery_loader.py
+   Function signature change (write_to_supabase):
+     BEFORE: def write_to_supabase(mapping_result, source_dataset, run_id, run_timestamp=None)
+     AFTER:  def write_to_supabase(mapping_result, source_dataset, run_id, run_timestamp=None, tenant_name="olist")
+
+   Body change:
+     BEFORE: sb.table("tenants").select("id").eq("name", "olist").execute()
+             logger.warning("[supabase] tenant 'olist' not found — skipping")
+     AFTER:  sb.table("tenants").select("id").eq("name", tenant_name).execute()
+             logger.warning("[supabase] tenant %r not found — skipping", tenant_name)
+
+3. schema-mapping/orchestrator_pipeline.py
+   Function signature change (run_mapping_pipeline):
+     BEFORE: def run_mapping_pipeline(..., client_label=None)
+     AFTER:  def run_mapping_pipeline(..., client_label=None, tenant_name="olist")
+
+   write_to_supabase call site:
+     BEFORE: write_to_supabase(mapping_result=mapping, source_dataset=source_label,
+                               run_id=run_id, run_timestamp=...)
+     AFTER:  write_to_supabase(mapping_result=mapping, source_dataset=source_label,
+                               run_id=run_id, run_timestamp=..., tenant_name=tenant_name)
+
+---
+
+WHAT WAS BUILT
+
+Issue 1 — Schema sync:
+backend/schema.sql now matches what the application actually writes. The three columns
+(source_samples, target_samples, explanation) are defined in the CREATE TABLE block,
+so fresh Supabase deployments get them automatically. The ALTER TABLE ADD COLUMN IF NOT EXISTS
+statements at the bottom make the file safe to run against the existing live Supabase DB —
+they are no-ops if the columns already exist, and add them if they don't.
+
+Data types chosen based on what the code actually writes:
+- source_samples / target_samples: Python lists of strings produced by .tolist() in
+  orchestrator.py. supabase-py serializes these as JSON arrays, so JSONB is correct.
+- explanation: Plain string from Gemini response.text.strip(), so TEXT is correct.
+
+Issue 2 — Tenant parameter:
+write_to_supabase() now accepts a tenant_name parameter (default "olist", preserving
+backward compatibility). run_mapping_pipeline() also accepts tenant_name and threads it
+through to write_to_supabase(). Callers that do not pass tenant_name continue to behave
+exactly as before. Callers that pass a different tenant name will now correctly look up
+that tenant in the tenants table instead of silently skipping on mismatch.
+
+---
+
+HOW IT WAS TESTED
+
+Not integration-tested against a live Supabase instance. The changes are:
+- Schema changes: syntactically correct SQL; ALTER TABLE IF NOT EXISTS is standard
+  PostgreSQL/Supabase syntax.
+- Python changes: verified by grep that the hardcoded string "olist" no longer appears
+  in write_to_supabase(), and that the tenant_name parameter is threaded from
+  run_mapping_pipeline() → write_to_supabase() call site.
+- No unit tests exist for write_to_supabase() in the repo; none were added.
+
+To manually verify Issue 1: run the ALTER TABLE block against the live Supabase DB and
+confirm the three columns appear in mapping_results.
+To manually verify Issue 2: call run_mapping_pipeline(..., tenant_name="some_other_tenant")
+and confirm the Supabase write attempts to look up "some_other_tenant" instead of "olist".
+
+---
+
+ASSUMPTIONS MADE
+
+1. JSONB over TEXT[] for samples: source_samples and target_samples are Python lists,
+   which supabase-py sends as JSON. JSONB is idiomatic in Supabase for structured data
+   and more queryable than TEXT[]. TEXT[] would also work but would require the client
+   to send a Postgres array literal.
+
+2. Default tenant_name="olist": The existing callers (tests, __main__ blocks) don't pass
+   a tenant. Defaulting to "olist" keeps them working without changes. If the intent was
+   to force callers to be explicit, the default should be removed — but that would break
+   existing call sites.
+
+3. ALTER TABLE statements placed after the INSERT block: The existing schema.sql runs
+   CREATE TABLE IF NOT EXISTS first, then seeds tenants. The ALTER TABLE statements are
+   appended at the end so the file remains top-down executable in a single pass on both
+   fresh and existing DBs.
+
+4. The live Supabase DB already has these columns (write_to_supabase has been writing
+   to them in production). The ALTER TABLE statements are defensive — they apply the
+   schema correctly if the DB was provisioned from schema.sql before the columns existed.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- The tenant fix only affects the Supabase write mirror. push_mapping_to_bigquery() has
+  no tenant concept — BigQuery results are not partitioned by tenant, only by source_dataset.
+- write_to_supabase() is still hardcoded to look up the tenant by exact name match. If
+  the tenants table has no row matching tenant_name, the write silently skips. There is
+  no fallback or auto-creation of tenants.
+- The __main__ block in orchestrator_pipeline.py uses dataset_name="olist_stage1" and
+  does not pass tenant_name, so it still defaults to "olist". This is correct for the
+  current pilot but not general.
+- No migration tooling (Alembic, supabase migrations) exists in this repo. schema.sql
+  with ALTER TABLE is a manual-run file, not an automated migration.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. Have the three columns (source_samples, target_samples, explanation) already been
+   added to the live Supabase DB by a prior deployment, or does the live DB actually
+   lack them? If they already exist, the ALTER TABLE statements are no-ops and this
+   change only fixes the repo's schema definition. If they don't exist, running the
+   ALTER TABLE block will add them — confirm which case applies before declaring the
+   schema in sync.
+
+2. Are there any callers of write_to_supabase() or run_mapping_pipeline() outside this
+   repo (e.g. in a notebook, a cron script, or an internal tool) that would now need to
+   pass tenant_name explicitly? The default of "olist" preserves backward compatibility,
+   but if another tenant's data has ever been pushed through the pipeline and silently
+   skipped, those runs are missing from Supabase.
+
+3. In schema.sql, the ALTER TABLE statements are now part of the file that also contains
+   CREATE TABLE and INSERT seeds. Is this file intended to be run as a one-time setup
+   script, or is it treated as idempotent and re-run on each deploy? If re-run, the
+   INSERT ... ON CONFLICT DO NOTHING and ADD COLUMN IF NOT EXISTS are safe, but confirm
+   no environment runs this file in a context where repeated execution would be a problem.

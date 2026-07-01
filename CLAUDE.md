@@ -45,17 +45,16 @@ MigrateHQ is a schema mapping engine that automatically maps source database col
 
 ## 3. NOT BUILT / KNOWN GAPS
 
-**Review Queue Approve/Override buttons are visual only.**
-`Clients.tsx:354-357` renders `<button className="btn btn-approve">Approve</button>` and `<button className="btn btn-override">Override</button>` with no `onClick` handlers. No backend endpoints exist for approval or override actions. The `correct` field in `mapping_results` is always `null` (the pipeline writes `None`); the "Correct" column in the UI always shows "—".
+**Review queue + confidence gate — resolved.** `mapping_results` now has a `status` column (`pending_review` / `approved` / `rejected`). High-confidence records (≥ 0.75) are auto-approved at pipeline write time and written to BigQuery immediately. Low-confidence records go to Supabase only as `pending_review`. `POST /approve` and `POST /reject` endpoints exist; /approve triggers the BigQuery write for the newly approved row. Approve/Override buttons in `Clients.tsx` are wired with loading state and optimistic queue removal. See `build_sesh_prompt_outputs/prompt2.txt`. **Known gap:** existing Supabase rows need a one-time backfill (`UPDATE mapping_results SET status='approved' WHERE confidence >= 0.75`) — the ALTER TABLE default sets them all to `pending_review`.
 
-**Confidence gate is NOT enforced.**
-The pipeline writes 100% of mapping results to BigQuery and Supabase unconditionally — low-confidence results are stored alongside high-confidence ones. Flagging (`flagged_for_review = confidence < 0.75`) is metadata only; no approval gate prevents flagged mappings from persisting. The review-then-approve flow is UI-incomplete (see above).
+The `correct` field in `mapping_results` is always `null` (the pipeline writes `None`); the "Correct" column in the UI always shows "—".
 
 **WMS export does not exist.**
 No file-export endpoint, no WMS template generation, no output formatter anywhere in the codebase. The file-export-not-API-writeback decision is a standing architectural intent, not implemented code.
 
-**Schema.sql is out of date — three columns missing.**
-`write_to_supabase()` in `bigquery_loader.py` inserts `source_samples`, `target_samples` (both written at pipeline time), and the explain endpoint updates `explanation` (written on first `/explain` call). None of these columns appear in `backend/schema.sql`. They exist in the live Supabase DB but are not in the repo's schema definition.
+**POST /api/ingest (built, prompt3 + addendum).** Accepts `source_file` + `target_file` (CSV uploads, 500 MB limit each) + `client_name` form field + `X-Tenant` header. Saves to OS temp files, calls `run_mapping_pipeline()` synchronously, cleans up, returns a run summary matching the shape of the runs history endpoint. Validation: CSV-only, non-empty, size limit. `python-multipart`, `pandas`, `valentine` added to `backend/requirements.txt` and installed. **No frontend upload UI yet.** Key limitations: synchronous (blocks connection for full pipeline duration); no auth beyond tenant whitelist validation.
+
+**Schema.sql — resolved.** `source_samples JSONB`, `target_samples JSONB`, and `explanation TEXT` added to the `mapping_results` CREATE TABLE definition. Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS` statements also added for existing deployments. See `build_sesh_prompt_outputs/prompt1.txt`.
 
 **BigQuery and Supabase schemas diverge for the same logical tables:**
 - `mapping_runs` in BQ has `run_timestamp`, `source_dataset`, `target_dataset`, `notes` — Supabase has `created_at`, `accuracy_pct`, `status`, `client_id` (FK) instead.
@@ -65,20 +64,20 @@ No file-export endpoint, no WMS template generation, no output formatter anywher
 **BigQuery fallback path gaps.**
 `bigquery_store.get_mapping_row()` returns `r.*` but BigQuery results table has no `explanation`, `source_samples`, or `target_samples` columns, so the `/explain` endpoint always generates fresh (never cached) when running in BigQuery mode.
 
-**No backend authentication exists.**
-There is no JWT validation, no server-side session check, and no middleware on any endpoint in `backend/main.py`. The `X-Tenant` header is read and used to scope queries, but it is never validated against any authenticated identity — any client can send any `X-Tenant` value and read that tenant's data. Frontend auth is two hardcoded demo accounts checked entirely client-side in `frontend/src/lib/auth.ts` (or `Login.tsx`); passing login does not create any server-side session. This is a known gap, intentionally deferred.
+**No backend authentication exists (partially mitigated, prompt5).**
+There is no JWT validation, no server-side session check, and no middleware on any endpoint in `backend/main.py`. Frontend auth is two hardcoded demo accounts checked entirely client-side in `frontend/src/lib/auth.ts`; passing login does not create any server-side session. Full JWT/OAuth auth is intentionally deferred.
 
-**L2 batching is not wired into the production pipeline.**
-`reasoner.py` contains `semantic_match_batch()` which can match multiple source columns against multiple targets in a single LLM call with mutual-exclusion reasoning. However, `orchestrator.py` calls `reason_best_match()` per column, which wraps `semantic_match_batch()` with a batch size of 1. Production L2 is therefore still functionally sequential single-column processing — one Gemini call per escalated column, with the 1-second sleep between calls. True batched matching is exercised in `schema-mapping/test_stage2.py` but is not wired into `orchestrator.py`.
+**Tenant whitelist validation — resolved (prompt5).** At startup, `_KNOWN_TENANTS` is loaded from the `tenants` Supabase table (or hardcoded to `{"migratehq", "olist"}` in BigQuery-only mode). Every endpoint now calls `_validate_tenant(tenant)` immediately after reading the `X-Tenant` header; unknown tenant names receive HTTP 404. Validation is fail-open if the startup load fails. **Remaining gap:** the backend validates that a tenant EXISTS but does not verify the caller is PERMITTED to access it — a user who knows a valid tenant name can still spoof the header and read that tenant's data. Aggregate endpoints like `/overview` also do not fully scope to a single tenant. See `build_sesh_prompt_outputs/prompt5.txt` for cross-check questions on these remaining gaps.
 
-**Tenant hardcoded to 'olist' in write path.**
-`write_to_supabase()` hardcodes `tenant='olist'` — if a different tenant's data is pushed through the pipeline, the Supabase write will fail silently (non-fatal log warning).
+**L2 batching — resolved (prompt4).** `orchestrator.py` now calls `semantic_match_batch()` directly (not `reason_best_match()`). Escalated columns are grouped by `_group_by_category()` into `timestamps / identifiers / status / other` using token-based name matching. One Gemini call is made per non-empty group with full mutual-exclusion reasoning across all columns in the group. For the Olist stage2 dataset: 3 calls instead of 8. Sleep is kept between batch calls. `reason_best_match()` still exists in `reasoner.py` for backward compat but is no longer called by orchestrator. **Open question**: the auto-grouping puts all 5 Olist date columns in one batch vs test_stage2's hand-tuned 4-batch split — accuracy vs the ground truth has not been re-validated with a live run.
+
+**Tenant hardcoded to 'olist' in write path — resolved.** `write_to_supabase()` now accepts `tenant_name: str = "olist"`. `run_mapping_pipeline()` accepts the same parameter and threads it through. Default preserves backward compatibility. See `build_sesh_prompt_outputs/prompt1.txt`.
 
 ---
 
 ## 4. KEY ARCHITECTURAL PRINCIPLES
 
-**Confidence gate (intended, not yet enforced):** Only human-approved mappings should ultimately reach the WMS export file. The review queue exists to surface low-confidence mappings (<0.75) for human sign-off before export. Currently, everything is written to storage regardless of confidence and review status. The Approve button must be wired before any WMS export feature is built.
+**Confidence gate (enforced as of prompt2):** Records with confidence ≥ 0.75 are auto-approved and written to BigQuery at pipeline time. Records below 0.75 are held in Supabase as `pending_review` and reach BigQuery only after a human approves them via `POST /approve`. Rejected records never reach BigQuery. The gate lives in `bigquery_loader.py:push_mapping_to_bigquery()` (filter) and `bigquery_store.py:push_approved_result()` (single-row write on approval).
 
 **File export, not API write-back:** The output of an approved mapping run should be a CSV/file in the WMS's native import template format. Do not build live API connectors to WMS systems. This keeps the integration surface simple and auditable.
 
@@ -89,6 +88,16 @@ There is no JWT validation, no server-side session check, and no middleware on a
 **1-second sleep between L2 LLM calls** in `orchestrator.py:98` to avoid rate-limiting. Do not remove without also adding retry/backoff logic.
 
 **WMS domain context** lives in `schema-mapping/claude.md` (not this file) and is loaded by `reasoner.py` at import time. It contains few-shot examples for WMS column name mappings. Edit that file to tune L2 reasoning; don't put it here.
+
+---
+
+## 6. BUILD SESSION LOG CONVENTION
+
+After every build task completed in any session, a verification file is written to `build_sesh_prompt_outputs/promptN.txt` (N increments; check the folder for the next available number before writing). Each file records: the task, every file changed with diffs or new signatures, what was actually built, how it was tested, assumptions made, known limitations, and cross-check questions for independent review.
+
+Before assuming project state from this CLAUDE.md alone, read `build_sesh_prompt_outputs/` — it is the authoritative log of what has actually been built, tested, and deferred. CLAUDE.md is updated periodically but the prompt files have finer-grained detail per task.
+
+Future sessions must continue this convention. Check the folder at the start of any build session to establish current state.
 
 ---
 
@@ -103,7 +112,7 @@ There is no JWT validation, no server-side session check, and no middleware on a
 | **BigQuery write** | `schema-mapping/bigquery_loader.py` → `push_mapping_to_bigquery()`, `write_to_supabase()` |
 | **BigQuery read (fallback)** | `backend/bigquery_store.py` — all read functions mirror `main.py` API surface |
 | **API server** | `backend/main.py` — all endpoints, Supabase client, Gemini explain |
-| **DB schema** | `backend/schema.sql` (WARNING: missing explanation/source_samples/target_samples columns) |
+| **DB schema** | `backend/schema.sql` — includes `source_samples`, `target_samples`, `explanation`, `status` columns (added prompt1/prompt2) |
 | **Frontend pages** | `frontend/src/pages/` — Login.tsx, Overview.tsx, Clients.tsx, Analytics.tsx, Settings.tsx |
 | **API client** | `frontend/src/lib/api.ts` |
 | **Auth / session** | `frontend/src/lib/auth.ts` |

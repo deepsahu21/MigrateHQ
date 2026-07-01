@@ -35,8 +35,20 @@ CREATE TABLE IF NOT EXISTS mapping_results (
   confidence FLOAT,
   layer TEXT,
   correct BOOLEAN,
-  flagged_for_review BOOLEAN
+  flagged_for_review BOOLEAN,
+  source_samples JSONB,
+  target_samples JSONB,
+  explanation TEXT,
+  status TEXT NOT NULL DEFAULT 'pending_review'
+    CHECK (status IN ('pending_review', 'approved', 'rejected'))
 );
+
+-- Apply missing columns to existing deployments (idempotent)
+ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS source_samples JSONB;
+ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS target_samples JSONB;
+ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS explanation TEXT;
+ALTER TABLE mapping_results ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_review'
+  CHECK (status IN ('pending_review', 'approved', 'rejected'));
 
 INSERT INTO tenants (name, display_name) VALUES
   ('migratehq', 'MigrateHQ'),

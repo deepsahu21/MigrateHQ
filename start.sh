@@ -9,6 +9,17 @@ if [ ! -f "$VENV/bin/uvicorn" ]; then
   exit 1
 fi
 
+free_port() {
+  local port="$1"
+  local pids
+  pids=$(lsof -ti tcp:"$port" 2>/dev/null || true)
+  if [ -n "$pids" ]; then
+    echo "Stopping process on port $port..."
+    kill $pids 2>/dev/null || true
+    sleep 1
+  fi
+}
+
 cleanup() {
   echo ""
   echo "Shutting down..."
@@ -17,6 +28,9 @@ cleanup() {
   exit 0
 }
 trap cleanup INT TERM
+
+free_port 8000
+free_port 5173
 
 # Backend (FastAPI on :8000)
 echo "Starting backend..."
@@ -29,6 +43,18 @@ echo "Starting frontend..."
 cd "$ROOT/frontend"
 npm run dev &
 FRONTEND_PID=$!
+
+for _ in $(seq 1 20); do
+  if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+
+if ! curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+  echo "ERROR: Backend failed to start on port 8000"
+  cleanup
+fi
 
 echo ""
 echo "  Backend:  http://localhost:8000"

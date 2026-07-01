@@ -4,8 +4,11 @@ L1 → L2 orchestration pipeline for schema mapping.
 Architecture:
   1. Layer 1 (Valentine JaccardDistanceMatcher) runs first on all source/target pairs.
   2. Matches with L1 confidence >= L1_THRESHOLD are accepted as-is.
-  3. Remaining columns are escalated to Layer 2 (Gemini) which picks the best
-     target from unclaimed candidates in a single LLM call per column.
+  3. Remaining columns are grouped by semantic category (timestamps, identifiers,
+     status, other) and escalated to Layer 2 (Gemini). Each category group is
+     further chunked into sub-batches of at most MAX_BATCH_SIZE columns so no
+     single LLM call receives an oversized, unfocused prompt. One call is made
+     per sub-batch with full mutual-exclusion reasoning across its columns.
   4. Returns a merged mapping with per-column provenance (L1 or L2).
 """
 import sys
@@ -19,10 +22,70 @@ import pandas as pd
 from valentine import valentine_match
 from valentine.algorithms import JaccardDistanceMatcher
 
-from layer2_claude.reasoner import reason_best_match
+from layer2_claude.reasoner import semantic_match_batch
 
-# ── Configurable threshold ─────────────────────────────────────────────────────
+# ── Configurable thresholds ────────────────────────────────────────────────────
 L1_THRESHOLD = 0.8
+MAX_BATCH_SIZE = 6  # max source columns per semantic_match_batch() call
+
+
+def _group_by_category(cols: list) -> dict:
+    """
+    Group column names into semantic buckets for batched L2 matching.
+
+    Splits each name on _, -, and space, then tests tokens against known word
+    sets. Priority: timestamps → identifiers → status → other.
+    Returns only non-empty groups in iteration order.
+    """
+    date_words   = {"date", "time", "ts", "at", "timestamp", "dt", "day", "when"}
+    id_words     = {"id", "ref", "code", "num", "number", "key", "uuid"}
+    status_words = {"status", "state", "stage", "type", "flag", "mode"}
+    groups: dict = {"timestamps": [], "identifiers": [], "status": [], "other": []}
+    for col in cols:
+        tokens = set(col.lower().replace("-", "_").replace(" ", "_").split("_"))
+        if tokens & date_words:
+            groups["timestamps"].append(col)
+        elif tokens & id_words:
+            groups["identifiers"].append(col)
+        elif tokens & status_words:
+            groups["status"].append(col)
+        else:
+            groups["other"].append(col)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _apply_l1_fallback(
+    src: str,
+    src_sample_list: list,
+    candidates: dict,
+    claimed_targets: set,
+    target_df,
+    final_mapping: dict,
+) -> None:
+    """Write the best unclaimed L1 candidate as an L1-fallback entry, or 'none'."""
+    ranked = candidates.get(src, [])
+    for best_tgt, best_score in ranked:
+        if best_tgt not in claimed_targets:
+            tgt_fb = (
+                target_df[best_tgt].dropna().astype(str).head(5).tolist()
+                if best_tgt in target_df.columns else []
+            )
+            final_mapping[src] = {
+                "target":         best_tgt,
+                "confidence":     best_score,
+                "layer":          "L1-fallback",
+                "source_samples": src_sample_list,
+                "target_samples": tgt_fb,
+            }
+            claimed_targets.add(best_tgt)
+            return
+    final_mapping[src] = {
+        "target":         None,
+        "confidence":     0.0,
+        "layer":          "none",
+        "source_samples": src_sample_list,
+        "target_samples": [],
+    }
 
 
 def run_orchestrator(
@@ -82,55 +145,78 @@ def run_orchestrator(
         else:
             escalate.append(src)
 
-    # ── Layer 2: LLM Reasoner ─────────────────────────────────────────────────
-    for src in escalate:
-        available_targets = [t for t in target_cols if t not in claimed_targets]
-        if not available_targets:
-            final_mapping[src] = {"target": None, "confidence": 0.0, "layer": "none"}
-            continue
+    # ── Layer 2: Batched semantic matching ────────────────────────────────────
+    # Group escalated columns by semantic category (timestamps, identifiers,
+    # status, other), then chunk each group into sub-batches of at most
+    # MAX_BATCH_SIZE columns. Each sub-batch is one semantic_match_batch()
+    # call with mutual-exclusion reasoning across its columns. claimed_targets
+    # is carried forward so targets cannot be double-assigned across sub-batches.
+    batch_groups = _group_by_category(escalate)
 
-        src_samples = source_df[src].dropna().astype(str).head(5).tolist()
-        target_samples_map = {
-            t: target_df[t].dropna().astype(str).head(5).tolist()
-            for t in available_targets
-        }
+    for batch_name, src_group in batch_groups.items():
+        sub_batches = [
+            src_group[i:i + MAX_BATCH_SIZE]
+            for i in range(0, len(src_group), MAX_BATCH_SIZE)
+        ]
+        for sub_idx, sub_group in enumerate(sub_batches):
+            sub_name = (
+                batch_name if len(sub_batches) == 1
+                else f"{batch_name}_{sub_idx + 1}"
+            )
 
-        time.sleep(1)  # avoid rate-limiting sequential LLM calls
-        result = reason_best_match(src, available_targets, src_samples, target_samples_map)
-        matched_tgt = result.get("best_match")
-
-        if matched_tgt and matched_tgt in available_targets:
-            final_mapping[src] = {
-                "target": matched_tgt,
-                "confidence": result.get("confidence", 0.0),
-                "layer": "L2",
-                "source_samples": src_samples,
-                "target_samples": target_samples_map.get(matched_tgt, []),
-            }
-            claimed_targets.add(matched_tgt)
-        else:
-            # L2 also failed — fall back to best unclaimed L1 candidate
-            ranked = candidates.get(src, [])
-            for best_tgt, best_score in ranked:
-                if best_tgt not in claimed_targets:
-                    tgt_fb_samples = target_df[best_tgt].dropna().astype(str).head(5).tolist() if best_tgt in target_df.columns else []
+            available_targets = [t for t in target_cols if t not in claimed_targets]
+            if not available_targets:
+                for src in sub_group:
                     final_mapping[src] = {
-                        "target": best_tgt,
-                        "confidence": best_score,
-                        "layer": "L1-fallback",
-                        "source_samples": src_samples,
-                        "target_samples": tgt_fb_samples,
+                        "target": None, "confidence": 0.0, "layer": "none",
+                        "source_samples": source_df[src].dropna().astype(str).head(5).tolist(),
+                        "target_samples": [],
                     }
-                    claimed_targets.add(best_tgt)
-                    break
-            else:
-                final_mapping[src] = {
-                    "target": None,
-                    "confidence": 0.0,
-                    "layer": "none",
-                    "source_samples": src_samples,
-                    "target_samples": [],
-                }
+                continue
+
+            src_samples = {
+                src: source_df[src].dropna().astype(str).head(5).tolist()
+                for src in sub_group
+            }
+            tgt_samples = {
+                t: target_df[t].dropna().astype(str).head(5).tolist()
+                for t in available_targets
+            }
+
+            time.sleep(1)  # rate-limit between every sub-batch call
+            matches = semantic_match_batch(
+                batch_name=sub_name,
+                source_columns=sub_group,
+                target_columns=available_targets,
+                source_samples=src_samples,
+                target_samples=tgt_samples,
+            )
+
+            resolved: set = set()
+            for m in matches:
+                src = m.get("source")
+                tgt = m.get("target")
+                conf = float(m.get("confidence") or 0.0)
+                if src not in sub_group:
+                    continue  # model hallucinated an unknown source column — skip
+                if tgt and tgt in available_targets and tgt not in claimed_targets:
+                    final_mapping[src] = {
+                        "target":         tgt,
+                        "confidence":     conf,
+                        "layer":          "L2",
+                        "source_samples": src_samples.get(src, []),
+                        "target_samples": tgt_samples.get(tgt, []),
+                    }
+                    claimed_targets.add(tgt)
+                else:
+                    # L2 returned null or a target already claimed — L1-fallback
+                    _apply_l1_fallback(src, src_samples.get(src, []), candidates, claimed_targets, target_df, final_mapping)
+                resolved.add(src)
+
+            # Safety: apply fallback for any source columns the model omitted entirely
+            for src in sub_group:
+                if src not in resolved:
+                    _apply_l1_fallback(src, src_samples.get(src, []), candidates, claimed_targets, target_df, final_mapping)
 
     return final_mapping
 

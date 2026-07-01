@@ -122,7 +122,13 @@ if __name__ == "__main__":
         ranked = candidates.get(src, [])
         if ranked and ranked[0][1] >= L1_THRESHOLD:
             best_tgt, best_score = ranked[0]
-            final_mapping[src] = {"target": best_tgt, "confidence": best_score, "layer": "L1"}
+            final_mapping[src] = {
+                "target": best_tgt,
+                "confidence": best_score,
+                "layer": "L1",
+                "source_samples": source_df[src].dropna().astype(str).head(5).tolist(),
+                "target_samples": target_df[best_tgt].dropna().astype(str).head(5).tolist() if best_tgt in target_df.columns else [],
+            }
             claimed_targets.add(best_tgt)
             l1_cols.append(src)
 
@@ -156,10 +162,22 @@ if __name__ == "__main__":
             tgt = m.get("target")
             conf = m.get("confidence", 0.0)
             if src and tgt and tgt in active_tgt and tgt not in claimed_targets:
-                l2_results[src] = {"target": tgt, "confidence": conf, "layer": "L2"}
+                l2_results[src] = {
+                    "target": tgt,
+                    "confidence": conf,
+                    "layer": "L2",
+                    "source_samples": src_samp.get(src, []),
+                    "target_samples": tgt_samp.get(tgt, []),
+                }
                 claimed_targets.add(tgt)
             elif src:
-                l2_results[src] = {"target": None, "confidence": 0.0, "layer": "L2-no-match"}
+                l2_results[src] = {
+                    "target": None,
+                    "confidence": 0.0,
+                    "layer": "L2-no-match",
+                    "source_samples": src_samp.get(src, []),
+                    "target_samples": [],
+                }
 
     for src in escalated:
         if src not in l2_results:

@@ -106,6 +106,9 @@ def push_mapping_to_bigquery(
         "notes": notes,
     }
 
+    # Only approved (high-confidence) records flow to BigQuery at pipeline time.
+    # Low-confidence records land in Supabase as pending_review and reach BigQuery
+    # only after a human approves them via the /approve endpoint.
     result_rows = [
         {
             "run_id": run_id,
@@ -117,6 +120,7 @@ def push_mapping_to_bigquery(
             "run_timestamp": run_timestamp,
         }
         for src, info in mapping_result.items()
+        if (info.get("confidence") or 0.0) >= 0.75
     ]
 
     job_config = bigquery.LoadJobConfig(
@@ -147,6 +151,7 @@ def write_to_supabase(
     source_dataset: str,
     run_id: str,
     run_timestamp: Optional[str] = None,
+    tenant_name: str = "olist",
 ) -> None:
     """
     Mirror one pipeline run to Supabase (clients → mapping_runs → mapping_results).
@@ -165,9 +170,9 @@ def write_to_supabase(
         ts = run_timestamp or datetime.now(timezone.utc).isoformat()
 
         # ── Ensure tenant exists ──────────────────────────────────────────────
-        tenant_resp = sb.table("tenants").select("id").eq("name", "olist").execute()
+        tenant_resp = sb.table("tenants").select("id").eq("name", tenant_name).execute()
         if not tenant_resp.data:
-            logger.warning("[supabase] tenant 'olist' not found — skipping")
+            logger.warning("[supabase] tenant %r not found — skipping", tenant_name)
             return
         tenant_id = tenant_resp.data[0]["id"]
 
@@ -210,15 +215,16 @@ def write_to_supabase(
         # ── Insert mapping_results ────────────────────────────────────────────
         rows = [
             {
-                "run_id":           run_id,
-                "source_column":    src,
-                "target_column":    info.get("target"),
-                "confidence":       info.get("confidence"),
-                "layer":            info.get("layer"),
-                "correct":          None,
+                "run_id":             run_id,
+                "source_column":      src,
+                "target_column":      info.get("target"),
+                "confidence":         info.get("confidence"),
+                "layer":              info.get("layer"),
+                "correct":            None,
                 "flagged_for_review": (info.get("confidence") or 0.0) < 0.75,
-                "source_samples":   info.get("source_samples"),
-                "target_samples":   info.get("target_samples"),
+                "source_samples":     info.get("source_samples"),
+                "target_samples":     info.get("target_samples"),
+                "status":             "approved" if (info.get("confidence") or 0.0) >= 0.75 else "pending_review",
             }
             for src, info in mapping_result.items()
         ]

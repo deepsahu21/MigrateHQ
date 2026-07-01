@@ -3,6 +3,7 @@ import { getSession } from './auth'
 function buildHeaders(): Record<string, string> {
   const session = getSession()
   const headers: Record<string, string> = {}
+  // Always use session.tenant as authoritative — callers cannot override this.
   if (session?.tenant) headers['X-Tenant'] = session.tenant
   return headers
 }
@@ -25,6 +26,21 @@ async function apiPost<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function apiPostForm<T>(path: string, body: FormData): Promise<T> {
+  // Do NOT set Content-Type — browser must set it with the multipart boundary.
+  const res = await fetch(path, { method: 'POST', headers: buildHeaders(), body })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    let detail = text || res.statusText
+    try {
+      const json = JSON.parse(text)
+      if (json.detail) detail = String(json.detail)
+    } catch (_) { /* raw text is fine */ }
+    throw new Error(`${res.status}: ${detail}`)
+  }
+  return res.json() as Promise<T>
+}
+
 export const api = {
   overview: ()                         => apiFetch<ApiOverview>('/api/overview'),
   activity: ()                         => apiFetch<ApiActivity[]>('/api/activity'),
@@ -38,6 +54,13 @@ export const api = {
   explain: (clientName: string, sourceColumn: string) => apiPost<ApiExplanation>(
     `/api/clients/${encodeURIComponent(clientName)}/mappings/${encodeURIComponent(sourceColumn)}/explain`
   ),
+  approve: (clientName: string, sourceColumn: string) => apiPost<ApiReviewAction>(
+    `/api/clients/${encodeURIComponent(clientName)}/mappings/${encodeURIComponent(sourceColumn)}/approve`
+  ),
+  reject: (clientName: string, sourceColumn: string) => apiPost<ApiReviewAction>(
+    `/api/clients/${encodeURIComponent(clientName)}/mappings/${encodeURIComponent(sourceColumn)}/reject`
+  ),
+  ingest: (form: FormData) => apiPostForm<ApiIngestResult>('/api/ingest', form),
 }
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -89,10 +112,28 @@ export interface ApiMappingResult {
   layer: 'L1' | 'L2' | 'L1-fallback' | 'none'
   correct: boolean | null
   flagged_for_review: boolean
+  status: 'pending_review' | 'approved' | 'rejected'
+}
+
+export interface ApiReviewAction {
+  source_column: string
+  status: 'approved' | 'rejected'
+  bq_written?: boolean
 }
 
 export interface ApiExplanation {
   explanation: string | null
   cached?: boolean
   error?: string
+}
+
+export interface ApiIngestResult {
+  run_id: string
+  created_at: string
+  total_columns: number
+  l1_count: number
+  l2_count: number
+  fallback_count: number
+  accuracy_pct: number
+  status: string
 }

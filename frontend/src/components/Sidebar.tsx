@@ -4,6 +4,7 @@ import {
   Users,
   BarChart2,
   Settings,
+  Upload,
   ChevronLeft,
   ChevronRight,
   Moon,
@@ -25,6 +26,7 @@ interface SidebarProps {
 const NAV_ITEMS = [
   { to: '/overview',  label: 'Overview',  icon: LayoutDashboard },
   { to: '/clients',   label: 'Clients',   icon: Users           },
+  { to: '/upload',    label: 'Upload',    icon: Upload          },
   { to: '/analytics', label: 'Analytics', icon: BarChart2       },
   { to: '/settings',  label: 'Settings',  icon: Settings        },
 ]

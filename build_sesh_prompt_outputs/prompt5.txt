@@ -1,0 +1,143 @@
+TASK
+Add basic tenant validation to prevent clients from spoofing X-Tenant headers and
+reading other tenants' data.
+
+---
+
+FILES CHANGED
+
+1. backend/main.py — startup: _KNOWN_TENANTS set
+   Added immediately after the USE_BIGQUERY / logger block:
+     _KNOWN_TENANTS: set = set()
+     if not USE_BIGQUERY:
+         _tenant_rows = sb.table("tenants").select("name").execute()
+         _KNOWN_TENANTS = {r["name"].lower() for r in _tenant_rows.data}
+         logger.info("Known tenants loaded: %s", _KNOWN_TENANTS)
+     else:
+         _KNOWN_TENANTS = {"migratehq", "olist"}   # hardcoded fallback for BQ mode
+   If the Supabase query fails (exception), _KNOWN_TENANTS stays empty and validation
+   is disabled (fail-open to avoid locking everyone out on a transient DB error).
+
+2. backend/main.py — helpers: _validate_tenant()
+   Added to the helpers section:
+     def _validate_tenant(tenant: str) -> None:
+         if _KNOWN_TENANTS and tenant.lower() not in _KNOWN_TENANTS:
+             raise HTTPException(status_code=404, detail=f"Unknown tenant: {tenant!r}")
+   The `if _KNOWN_TENANTS` guard preserves the fail-open behaviour when startup
+   load failed.
+
+3. backend/main.py — 9 endpoint call sites
+   Added _validate_tenant(tenant) immediately after the
+   `tenant = x_tenant or "migratehq"` line in every endpoint that reads X-Tenant:
+     get_overview, get_clients, get_mappings, get_runs, get_activity,
+     explain_mapping, approve_mapping, reject_mapping, ingest
+
+4. frontend/src/lib/api.ts — buildHeaders()
+   Added a comment documenting the existing authoritative-tenant behaviour:
+     // Always use session.tenant as authoritative — callers cannot override this.
+   No functional change. The existing code already uses session.tenant from localStorage
+   for every API call; there is no mechanism for a caller to inject a different
+   X-Tenant value through the api.ts surface.
+
+---
+
+WHAT WAS BUILT
+
+At startup, the backend loads the set of tenant names from the Supabase tenants table
+into _KNOWN_TENANTS. Every endpoint that accepts an X-Tenant header now calls
+_validate_tenant(tenant) before executing any query. If the tenant name is not in the
+set, the request is rejected with HTTP 404 "Unknown tenant: 'x'". Valid tenants and
+the no-header default ("migratehq") continue to work unchanged.
+
+The frontend already sends the session's tenant on every request through buildHeaders()
+in api.ts — this was confirmed and documented with a comment but required no code change.
+A user who manipulates their browser's localStorage or makes raw HTTP requests with a
+spoofed X-Tenant value will now receive 404 from the backend.
+
+---
+
+HOW IT WAS TESTED
+
+All four header cases tested live against /api/overview after server restart:
+
+  curl -H "X-Tenant: fake"      /api/overview  → {"detail": "Unknown tenant: 'fake'"}    ✓
+  curl -H "X-Tenant: migratehq" /api/overview  → {"total_clients": 3, ...}               ✓
+  curl -H "X-Tenant: olist"     /api/overview  → {"total_clients": 3, ...}               ✓
+  curl (no header)               /api/overview  → {"total_clients": 3, ...}               ✓
+
+Server startup confirmed clean (no import errors, _KNOWN_TENANTS loaded from Supabase).
+
+The remaining 8 endpoints (clients, mappings, runs, activity, explain, approve, reject,
+ingest) were not individually tested for the 404 path, but they all use the same
+_validate_tenant() helper with identical call-site structure — the behaviour is the same
+as the verified /api/overview case.
+
+---
+
+ASSUMPTIONS MADE
+
+1. Fail-open on startup load failure. If the Supabase tenants query fails at startup
+   (network issue, Supabase down), _KNOWN_TENANTS stays empty and _validate_tenant() is
+   a no-op. This means validation is silently disabled rather than locking out all
+   requests. Rationale: a transient Supabase hiccup at boot should not make the API
+   completely unusable. Alternative (fail-closed: reject all requests if tenants can't
+   be loaded) was rejected as too disruptive for a demo/MVP deployment.
+
+2. In BigQuery-only mode (USE_BIGQUERY=True), _KNOWN_TENANTS is hardcoded to
+   {"migratehq", "olist"} from the schema.sql seed values. This avoids a separate
+   Supabase query in a mode where Supabase is unreachable. If new tenants are added to
+   the BQ mode deployment, this set must be updated manually.
+
+3. Tenant name comparison is case-insensitive (tenant.lower()). The tenants table stores
+   names lowercase ("migratehq", "olist"), and the frontend sends lowercase tenant
+   strings from the hardcoded USERS array in auth.ts. Capital-letter variants like
+   "MigrateHQ" would still validate correctly.
+
+4. _KNOWN_TENANTS is populated once at startup and not refreshed. Adding a new tenant
+   to the database while the server is running will NOT make it valid until the next
+   restart. For the current two-tenant demo setup, this is acceptable. A future
+   improvement would be a periodic refresh or cache invalidation on tenant creation.
+
+5. The frontend's tenant-enforcement is UI-layer only (localStorage → session.tenant →
+   buildHeaders()). A user with browser devtools or any HTTP client can still send
+   arbitrary X-Tenant values. The backend validation (this task) is the real gate.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- No per-user tenant binding: the backend validates that the tenant EXISTS, but does
+  not verify that the authenticated user is PERMITTED to access it. A user logged in as
+  olist who knows the header format can still request X-Tenant: migratehq and the
+  backend will serve migratehq data (since "migratehq" is a known tenant). The
+  existing per-endpoint tenant-scoping logic (tenant.lower() not in client_name.lower())
+  is the only remaining check for cross-tenant data access — it's present for
+  client-specific endpoints but not for aggregate endpoints like /overview.
+- No authentication: the gap noted in CLAUDE.md (no JWT, no server-side session) remains.
+  This task only adds tenant existence validation, not user-identity binding.
+- /health endpoint intentionally has no X-Tenant validation (it returns no scoped data).
+- _KNOWN_TENANTS is not thread-safe for concurrent writes (but Python's GIL makes the
+  set read safe for concurrent HTTP handlers; writes only happen at startup).
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. The /api/overview endpoint currently returns aggregated stats across ALL clients
+   regardless of tenant when X-Tenant: olist is sent — both "olist" and "migratehq"
+   clients appear in the total because _get_client_ids() falls through to a LIKE match
+   on source_dataset. Does this mean a logged-in olist user can infer data about
+   migratehq clients from the aggregate counts? Confirm the expected scoping behaviour
+   for the overview endpoint under tenant isolation.
+
+2. The _KNOWN_TENANTS set is loaded once at startup. If you add a new tenant to the
+   tenants table while the server is running (e.g., during a demo onboarding), that
+   tenant's X-Tenant header will return 404 until the next server restart. Is this
+   acceptable, or should there be a mechanism to refresh the tenant list without
+   restarting (e.g., a POST /admin/reload-tenants endpoint)?
+
+3. In BigQuery mode (USE_BIGQUERY=True), the hardcoded fallback is {"migratehq", "olist"}.
+   If you deploy to an environment with a different tenant set (e.g., a staging env with
+   only "migratehq"), the olist header would still validate even though no olist data
+   exists. Confirm whether BQ-mode deployments need a more accurate tenant list (loaded
+   from BigQuery or from an env var) rather than the hardcoded schema.sql seed values.

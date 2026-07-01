@@ -1,0 +1,194 @@
+TASK
+Fix two tenant-scoping gaps in backend/main.py:
+  Issue 1 — /api/overview leaks aggregate data across tenants (LIKE fallback in _get_client_ids)
+  Issue 2 — /approve and /reject only work on a client's latest run; no way to target an older one
+
+---
+
+FILES CHANGED
+
+backend/main.py — 5 changes
+
+1. Import: added Query to the fastapi import list (required for optional query param).
+   BEFORE: from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+   AFTER:  from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+
+2. _get_client_ids() — removed LIKE fallback, return type narrowed to List[str]
+   The old code had a three-branch structure:
+     a. migratehq → return all clients
+     b. non-migratehq, tenant found in DB → filter by tenant_id FK
+     c. non-migratehq, tenant NOT in tenants table → ilike("source_dataset", f"%{tenant}%") fallback
+   Branch (c) was the leak: if a tenant's clients had source_dataset names that happened to
+   contain the tenant's string (e.g., olist clients with "olist_orders_dataset"), an olist
+   user could also see them via the LIKE match even if they belonged to a different tenant.
+   Also, if the tenant was valid but had no tenant_id FK set on any client rows, the LIKE
+   fallback could return arbitrary cross-tenant clients.
+   NEW behavior:
+     a. migratehq → return all clients (unchanged — intentional admin view)
+     b. non-migratehq, tenant found in DB → filter by tenant_id FK
+     c. non-migratehq, tenant NOT in tenants table → return [] (no cross-tenant fallback)
+   Return type annotation corrected from Optional[List[str]] to List[str] (the function
+   now always returns a list, never None).
+
+3. _resolve_run_id() — new helper, added above the endpoints section
+   Signature: _resolve_run_id(client_id: str, run_id: Optional[str]) -> str
+   Logic:
+     - If run_id is provided: query mapping_runs WHERE run_id=run_id AND client_id=client_id.
+       If no row returned, raise HTTPException(404, "Run ... not found for this client").
+       This also handles the cross-client case (a run_id from a different client returns no row
+       because the client_id filter won't match).
+     - If run_id is None: query latest run for client_id by created_at DESC LIMIT 1.
+       If no rows, raise HTTPException(404, "No runs found for this client").
+   Raises 404 in all not-found cases; callers propagate via the existing except HTTPException
+   re-raise block.
+
+4. approve_mapping() — added run_id: Optional[str] = Query(None, ...) parameter
+   The run_resp / run_id resolution block (4 lines) replaced by:
+     run_id = _resolve_run_id(client_id, run_id)
+   run_id is then used in the row_resp lookup as before.
+   Docstring updated to document the ?run_id= query parameter.
+
+5. reject_mapping() — same change as approve_mapping()
+   run_resp block replaced by _resolve_run_id call.
+   Docstring updated.
+
+---
+
+WHAT WAS BUILT
+
+ISSUE 1 FIX — strict tenant scoping in _get_client_ids():
+  The LIKE fallback has been removed. For non-admin tenants, the ONLY path to client IDs
+  is now the tenant_id FK on the clients table. If a valid tenant has no clients with
+  a matching tenant_id, _get_client_ids() returns [] and all endpoints that depend on it
+  (/overview, /clients, /activity) return empty/zero results rather than leaking data.
+
+  The admin tenant (migratehq) still sees all clients unconditionally — this is intentional.
+
+ISSUE 2 FIX — run_id query parameter on /approve and /reject:
+  Both endpoints now accept an optional ?run_id=<uuid> query parameter.
+  - Without run_id: behavior is identical to before — latest run is used.
+  - With run_id: _resolve_run_id() verifies the run exists AND belongs to the requesting
+    client before proceeding. Cross-client spoofing (passing another client's run_id)
+    is blocked by the client_id filter in the query.
+
+---
+
+HOW IT WAS TESTED
+
+All tests run against the live server (Supabase mode, port 8000) after restart.
+
+ISSUE 1 — Tenant scoping:
+
+  Test 1: migratehq (admin) GET /api/overview
+    curl -H "X-Tenant: migratehq" /api/overview
+    → {"total_clients": 3, "overall_accuracy_pct": 95.8, ...}  ✓ (sees all 3 clients)
+
+  Test 2: olist GET /api/overview
+    curl -H "X-Tenant: olist" /api/overview
+    → {"total_clients": 3, "overall_accuracy_pct": 95.8, ...}  ✓
+    (In this demo, all 3 clients belong to the olist tenant; the counts match because
+    the data is correctly scoped, not because of a leak. See NOTE below.)
+
+  Test 3: fake tenant GET /api/overview
+    curl -H "X-Tenant: acmecorp" /api/overview
+    → {"detail": "Unknown tenant: 'acmecorp'"}  ✓ (existing validation still works)
+
+  NOTE on test 2: In the demo environment, all 3 clients were created under the olist
+  tenant (source_dataset names all start with "olist_"). So migratehq admin and olist
+  tenant both see 3 clients. This is CORRECT — not a remaining leak. The old LIKE
+  fallback also returned the same 3 clients (since their names contain "olist"). The fix
+  removes the unsafe fallback path; the result is identical here because the data is
+  correctly tagged with tenant_id. A scenario where the fix would produce a DIFFERENT
+  result (fewer clients for olist) would require a mixed-tenant environment where some
+  clients have "olist" in their source_dataset but a different tenant_id — that's the
+  leak the fix prevents.
+
+ISSUE 2 — run_id targeting:
+
+  Client: olist_orders_stage2_man
+  Run history: two runs
+    latest: 4b5374ba-990c-4578-82aa-680e45930d7e (2026-06-14)
+    older:  14fffe67-dab6-40e9-b2c1-b8cbf14a5e34 (2026-06-12)
+
+  Test 1: approve without run_id (backward compat — latest run)
+    POST /approve (no query param)
+    → {"source_column": "customer_id", "status": "approved", "bq_written": false}  ✓
+
+  Test 2: approve with explicit run_id targeting the older run
+    POST /approve?run_id=14fffe67-dab6-40e9-b2c1-b8cbf14a5e34
+    → {"source_column": "customer_id", "status": "approved", "bq_written": false}  ✓
+
+  Test 3: approve with non-existent run_id
+    POST /approve?run_id=00000000-0000-0000-0000-000000000000
+    → {"detail": "Run '00000000-0000-0000-0000-000000000000' not found for this client"}  ✓
+
+  Test 4: approve with a valid run_id that belongs to a different client (cross-client spoofing)
+    Run 89d1e487-... belongs to olist_orders_stage3_man, requested against stage2_man
+    POST /approve?run_id=89d1e487-47a3-4e42-9842-89353a5cf8e5
+    → {"detail": "Run '89d1e487-47a3-4e42-9842-89353a5cf8e5' not found for this client"}  ✓
+
+  reject endpoint was not separately tested (identical code path via _resolve_run_id).
+
+---
+
+ASSUMPTIONS MADE
+
+1. All current clients have tenant_id set. The pipeline's write_to_supabase() creates
+   clients with tenant_id populated since prompt1. Old manually-inserted demo clients
+   that lack tenant_id would now show up as empty for their tenant — a correct result
+   for the scoping logic, though it might confuse demo testing. No evidence of such rows
+   in the current dataset (all 3 clients appear correctly scoped to olist).
+
+2. migratehq is the only admin tenant. The "migratehq → return all clients" branch is a
+   hardcoded special case. If a second admin tenant is needed in the future, this would
+   need to become a role/flag check rather than a name check.
+
+3. The run_id query parameter is backward compatible. Existing frontend calls (approve/
+   reject buttons in Clients.tsx) do not pass run_id, so they continue to use the latest
+   run. No frontend changes are required.
+
+4. bq_written: false on both approve tests is expected. The test columns (customer_id)
+   were already approved (status='approved') from a prior session, so was_pending was
+   False and no BQ write was triggered. The endpoint returned 200 regardless — calling
+   approve on an already-approved row is idempotent.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- The frontend has no UI for selecting a specific run when approving/rejecting. The
+  ?run_id= parameter is backend-only. A future task can add a run selector to the
+  Review Queue UI and pass the run_id when calling api.approve()/api.reject().
+
+- Mixed-tenant demo data can't be easily created to verify the leak is fully plugged
+  without adding new clients with a non-olist tenant_id. The structural fix (removing
+  the LIKE fallback) is correct; full verification requires a multi-tenant dataset.
+
+- /api/clients endpoint uses the same _get_client_ids() and is also fixed by this
+  change, but was not separately curled for the scoping test (the client name listing
+  confirmed client data is scoped identically to /api/overview).
+
+- reject with run_id was not separately curled (code path is identical to approve via
+  _resolve_run_id; confirmed by code inspection).
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. Can olist clients be created with a source_dataset that does NOT contain "olist"?
+   If yes, those clients would now return empty for the olist tenant (since the LIKE
+   fallback was removed), even though they were previously visible. Audit the clients
+   table to confirm all olist clients have proper tenant_id set and will still be found
+   by the FK path.
+
+2. The _resolve_run_id helper raises 404 if the run_id doesn't belong to the client_id.
+   This is the correct security behavior. However, it also means a typo in run_id
+   (by a developer calling the API directly) returns 404 rather than 400. Is this
+   acceptable, or should the 404 detail message be more specific ("run not found vs.
+   wrong client")?
+
+3. The admin tenant (migratehq) approve/reject path still uses _resolve_run_id, which
+   queries client_id. An admin approving a row from a specific run would pass a run_id
+   that must belong to the client they're operating on (not just any run in the system).
+   Confirm this is the desired behavior: admin approval is still scoped to a specific
+   client, not globally across all clients.

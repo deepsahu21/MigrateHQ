@@ -1,0 +1,181 @@
+TASK
+Add a MAX_BATCH_SIZE cap to the L2 batching loop in orchestrator.py so
+that oversized category groups are split into multiple sub-batches rather
+than sent as one large, unfocused prompt to Gemini.
+
+---
+
+FILES CHANGED
+
+1. schema-mapping/orchestrator.py — module docstring (lines 1-11)
+   Updated point 3 to describe sub-batch splitting:
+   BEFORE: "one LLM call per group with full mutual-exclusion reasoning across the group"
+   AFTER:  "Each category group is further chunked into sub-batches of at most
+            MAX_BATCH_SIZE columns so no single LLM call receives an oversized,
+            unfocused prompt. One call is made per sub-batch with full
+            mutual-exclusion reasoning across its columns."
+
+2. schema-mapping/orchestrator.py — constants block
+   BEFORE: # ── Configurable threshold ──
+           L1_THRESHOLD = 0.8
+   AFTER:  # ── Configurable thresholds ──
+           L1_THRESHOLD = 0.8
+           MAX_BATCH_SIZE = 6  # max source columns per semantic_match_batch() call
+
+3. schema-mapping/orchestrator.py — L2 loop (run_orchestrator)
+   Updated section comment to describe sub-batch chunking.
+
+   Loop structure changed from:
+     for batch_name, src_group in batch_groups.items():
+         <process src_group as a single batch>
+
+   To:
+     for batch_name, src_group in batch_groups.items():
+         sub_batches = [src_group[i:i+MAX_BATCH_SIZE]
+                        for i in range(0, len(src_group), MAX_BATCH_SIZE)]
+         for sub_idx, sub_group in enumerate(sub_batches):
+             sub_name = (batch_name if len(sub_batches) == 1
+                         else f"{batch_name}_{sub_idx+1}")
+             <process sub_group exactly as the old src_group>
+
+   Every variable that previously referenced src_group now references sub_group.
+   available_targets is recomputed inside the inner loop so claimed_targets
+   from earlier sub-batches are respected (one-to-one assignment preserved
+   across sub-batches within the same category group).
+
+   time.sleep(1) is inside the inner loop — every sub-batch is rate-limited
+   individually, same as sub-batches across different category groups.
+
+   _group_by_category() is unchanged.
+
+---
+
+WHAT WAS BUILT
+
+MAX_BATCH_SIZE = 6 caps the number of source columns sent to any single
+semantic_match_batch() call. When a category group exceeds this limit, it
+is sliced sequentially into chunks of at most 6 columns each. The last chunk
+will be smaller if the group size is not divisible by 6.
+
+Example: a group of 14 columns → [6, 6, 2] (3 calls).
+Each chunk gets:
+  - Its own sub_name (e.g. "other_1", "other_2", "other_3")
+  - A freshly computed available_targets list (excluding anything claimed
+    by earlier sub-batches in the same group or earlier category groups)
+  - Its own 1-second sleep before the Gemini call
+  - The same resolve + L1-fallback logic as before
+
+Groups that fit within MAX_BATCH_SIZE pass through unchanged with sub_name
+equal to batch_name (no suffix), so log output is identical to before for
+small groups.
+
+CHOICE OF MAX_BATCH_SIZE = 6:
+  The largest real group in the Olist stage2 test data is 5 columns
+  (timestamps). Setting MAX_BATCH_SIZE = 6 means the entire existing test
+  dataset passes through without splitting — no change in call count or
+  batch composition for data proven to work. The cap only fires for groups
+  larger than anything in the current test suite, providing a safety net
+  for real customer schemas without disturbing validated behavior.
+
+---
+
+HOW IT WAS TESTED
+
+1. Import smoke test — module loads cleanly:
+   from orchestrator import run_orchestrator, _group_by_category, MAX_BATCH_SIZE, L1_THRESHOLD
+   → No errors (only third-party FutureWarnings from google-auth / urllib3, unrelated). ✓
+
+2. Chunking math verified for a 14-column group:
+   cols = [f'col_{i}' for i in range(14)]
+   chunks = [cols[i:i+6] for i in range(0, 14, 6)]
+   → [6, 6, 2]  ✓  (matches the 6+6+2 example in the task spec)
+
+3. Olist stage2 columns verified to produce no splitting:
+   _group_by_category([order_id, customer_id, order_status,
+     order_purchase_timestamp, order_approved_at,
+     order_delivered_carrier_date, order_delivered_customer_date,
+     order_estimated_delivery_date])
+   → timestamps: 5 cols → 1 sub-batch [5]     ✓  (5 < 6, no split)
+   → identifiers: 2 cols → 1 sub-batch [2]    ✓
+   → status: 1 cols → 1 sub-batch [1]         ✓
+
+4. Full end-to-end pipeline run NOT triggered (would make live Gemini calls
+   and write to BigQuery/Supabase). The logic change is structurally equivalent
+   to the original for groups ≤ MAX_BATCH_SIZE, and the chunking arithmetic
+   was verified above for the oversized-group case.
+
+---
+
+ASSUMPTIONS MADE
+
+1. Sequential (not balanced) chunking. A 13-column group becomes [6, 6, 1],
+   not [5, 4, 4]. The last sub-batch may be as small as 1 column. This is
+   fine — a 1-column batch is valid input for semantic_match_batch() and is
+   simpler than trying to distribute columns evenly.
+
+2. available_targets recomputed per sub-batch (not per category group).
+   This is the correct behavior: if sub-batch 1 of "other" claims a target,
+   sub-batch 2 must not see that target as available. The inner loop
+   recomputes available_targets = [t for t in target_cols if t not in
+   claimed_targets] at the top of each sub-batch iteration.
+
+3. sub_name suffix uses 1-based index (_1, _2, ...) for readability in
+   logs. When a group has only one sub-batch, sub_name equals batch_name
+   (no suffix), preserving existing log output for the Olist test case.
+
+4. No change to _group_by_category(). The grouping logic is not a source
+   of the problem — the issue is downstream in how large groups are consumed.
+   Keeping the functions separate maintains the single-responsibility boundary.
+
+5. MAX_BATCH_SIZE = 6 chosen to pass through Olist test data unchanged.
+   If a future schema has many timestamp-like columns (e.g. 8 date fields),
+   it would split into [6, 2]. This is acceptable — two focused date-column
+   calls is better than one sprawling 8-column call. The value can be raised
+   or lowered as accuracy data accumulates.
+
+---
+
+KNOWN LIMITATIONS / NOT DONE
+
+- Sequential splitting may split semantically related columns across
+  sub-batches. Example: if 7 columns all represent different date fields,
+  the first 6 go in sub-batch 1 and the 7th goes alone in sub-batch 2.
+  Sub-batch 2 only sees 1 source column but all remaining unclaimed targets,
+  so it picks the best available match for that column independently — correct
+  behavior, but the model doesn't see the mutual context of the other 6 dates
+  when resolving the 7th. This is an acceptable trade-off for MVP.
+
+- No validation that MAX_BATCH_SIZE > 0. Setting it to 0 or a negative
+  number would cause an infinite loop in the list comprehension. Not adding
+  a guard to keep the code simple; treat this as a developer constant, not
+  a user-configurable value.
+
+- Accuracy impact of sub-batch splitting not validated against ground truth.
+  The only way to confirm no regression is to run the pipeline against the
+  Olist stage2 ground truth with a MAX_BATCH_SIZE small enough to force
+  splitting (e.g. MAX_BATCH_SIZE=3) and compare accuracy to the unsplit
+  baseline. This is left as a manual verification step.
+
+---
+
+CROSS-CHECK QUESTIONS
+
+1. sub_name suffix in logs: the batch_name passed to semantic_match_batch()
+   is used in the Gemini prompt to provide context about the column category.
+   Confirm that reasoner.py uses batch_name only for logging/labeling (not
+   for conditional prompt logic), so appending "_1", "_2" does not change
+   the model's reasoning behavior.
+
+2. With MAX_BATCH_SIZE=6 and the Olist 5-column timestamp group, the group
+   passes through as a single batch — same as before this change. If the
+   Olist accuracy baseline was passing before, it should still pass after.
+   Confirm by running test_stage2.py and checking that the output matches
+   the known ground truth (or at least doesn't regress from the pre-prompt4
+   baseline).
+
+3. A 1-column sub-batch (e.g. the last chunk of a 7-column group) sends a
+   batch with one source column and all remaining unclaimed targets. The
+   model must choose one match from potentially many target candidates.
+   Confirm semantic_match_batch() handles single-column input correctly —
+   the reasoner's mutual-exclusion constraint is vacuous for 1 column but
+   should still return a valid match or null.

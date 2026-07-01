@@ -1,0 +1,2 @@
+File size limit adjusted 10 MB → 500 MB in POST /api/ingest.
+Changed: _MAX_UPLOAD_BYTES in backend/main.py (constant + two error message strings).

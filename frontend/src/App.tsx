@@ -6,6 +6,7 @@ import Overview from './pages/Overview'
 import Clients from './pages/Clients'
 import Analytics from './pages/Analytics'
 import Settings from './pages/Settings'
+import Upload from './pages/Upload'
 import { getSession, logout, Session } from './lib/auth'
 
 export default function App() {
@@ -59,6 +60,7 @@ export default function App() {
                     <Route path="/"          element={<Navigate to="/overview" replace />} />
                     <Route path="/overview"  element={<Overview  session={session} />} />
                     <Route path="/clients"   element={<Clients   session={session} />} />
+                    <Route path="/upload"     element={<Upload     session={session} />} />
                     <Route path="/analytics" element={<Analytics />} />
                     <Route path="/settings"  element={<Settings />} />
                   </Routes>
