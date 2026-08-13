@@ -1,0 +1,171 @@
+{
+  "client": "clientB",
+  "tenant": "tenant_2",
+  "client_id": "ce2d7ece-a00b-44b2-82ef-16dc820336a0",
+  "source_run_id": "57c9b739-b4f6-4729-a0b3-31efe087319f",
+  "captured_at": "2026-08-13T18:27:25.460259+00:00",
+  "gate_logic_source": "schema-mapping/bigquery_loader.py:425 (status assignment) via _is_approved() at schema-mapping/bigquery_loader.py:51-80, APPROVAL_THRESHOLD=0.75 at line 48",
+  "approval_threshold": 0.75,
+  "source_file": {
+    "present": true,
+    "stored_dir": "demo/snapshots/clientB_source",
+    "files": [
+      {
+        "original_filename": "source.pdf",
+        "stored_path": "demo/snapshots/clientB_source/source.pdf",
+        "bytes": 2532
+      },
+      {
+        "original_filename": "source_extracted.csv",
+        "stored_path": "demo/snapshots/clientB_source/source_extracted.csv",
+        "bytes": 280
+      }
+    ]
+  },
+  "mapping_runs": {
+    "id": "94fd96bb-041d-470a-aca9-3ba1841629e2",
+    "client_id": "ce2d7ece-a00b-44b2-82ef-16dc820336a0",
+    "created_at": "2026-08-10T02:40:57.695132+00:00",
+    "total_columns": 5,
+    "l1_count": 0,
+    "l2_count": 2,
+    "fallback_count": 3,
+    "accuracy_pct": 40,
+    "status": "completed",
+    "source_storage_path": "8035ab31-eb3c-4bbd-bc9a-2155857be822/57c9b739-b4f6-4729-a0b3-31efe087319f/source.pdf",
+    "cache_count": 0,
+    "collision_count": 0
+  },
+  "mapping_results": [
+    {
+      "source_column": "Cartons",
+      "target_column": "quantity",
+      "confidence": 0.166666666666667,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "6",
+        "4",
+        "10",
+        "8",
+        "12"
+      ],
+      "target_samples": [
+        "24",
+        "10"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Item #",
+      "target_column": "sku",
+      "confidence": 0.95,
+      "layer": "L2",
+      "correct": null,
+      "flagged_for_review": false,
+      "source_samples": [
+        "CHG-001",
+        "CHG-002",
+        "CHG-014",
+        "CHG-020",
+        "CHG-033"
+      ],
+      "target_samples": [
+        "SKU-1001",
+        "SKU-1002"
+      ],
+      "explanation": null,
+      "status": "approved",
+      "exported_at": "2026-08-10T14:08:38.370936+00:00",
+      "export_id": "348c6563-c637-41b5-bff5-71ab94142c0b",
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "approved"
+    },
+    {
+      "source_column": "Product",
+      "target_column": "product_name",
+      "confidence": 0.97,
+      "layer": "L2",
+      "correct": null,
+      "flagged_for_review": false,
+      "source_samples": [
+        "Ceramic Vase - Terracotta 10in",
+        "Ceramic Vase - Terracotta 14in",
+        "Woven Placemat Set (4pk) - Natural",
+        "Linen Table Runner - Sand",
+        "Rattan Coaster Set (6pk)"
+      ],
+      "target_samples": [
+        "Widget A",
+        "Widget B"
+      ],
+      "explanation": null,
+      "status": "approved",
+      "exported_at": "2026-08-10T14:08:38.370936+00:00",
+      "export_id": "348c6563-c637-41b5-bff5-71ab94142c0b",
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "approved"
+    },
+    {
+      "source_column": "Total Units",
+      "target_column": "warehouse_location",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "72",
+        "32",
+        "200",
+        "120",
+        "288"
+      ],
+      "target_samples": [
+        "A-01-03",
+        "B-02-01"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Units/Carton",
+      "target_column": "unit_of_measure",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "12",
+        "8",
+        "20",
+        "15",
+        "24"
+      ],
+      "target_samples": [
+        "EA",
+        "CS"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    }
+  ]
+}

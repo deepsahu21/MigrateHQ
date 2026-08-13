@@ -1,0 +1,218 @@
+{
+  "client": "clientA",
+  "tenant": "tenant_2",
+  "client_id": "9d7710b7-a7c4-4310-a80b-7d105708293b",
+  "source_run_id": "f8dce22e-925e-4d90-826b-55b6501bbe3f",
+  "captured_at": "2026-08-13T15:45:47.256648+00:00",
+  "gate_logic_source": "schema-mapping/bigquery_loader.py:425 (status assignment) via _is_approved() at schema-mapping/bigquery_loader.py:51-80, APPROVAL_THRESHOLD=0.75 at line 48",
+  "approval_threshold": 0.75,
+  "source_file": {
+    "present": true,
+    "stored_dir": "demo/snapshots/clientA_source",
+    "files": [
+      {
+        "original_filename": "source.csv",
+        "stored_path": "demo/snapshots/clientA_source/source.csv",
+        "bytes": 1196
+      }
+    ]
+  },
+  "mapping_runs": {
+    "id": "14072a3c-4fe1-4994-a51c-d05882ec459d",
+    "client_id": "9d7710b7-a7c4-4310-a80b-7d105708293b",
+    "created_at": "2026-08-10T02:42:29.772028+00:00",
+    "total_columns": 7,
+    "l1_count": 0,
+    "l2_count": 1,
+    "fallback_count": 6,
+    "accuracy_pct": 14.29,
+    "status": "completed",
+    "source_storage_path": "8035ab31-eb3c-4bbd-bc9a-2155857be822/f8dce22e-925e-4d90-826b-55b6501bbe3f/source.csv",
+    "cache_count": 0,
+    "collision_count": 0
+  },
+  "mapping_results": [
+    {
+      "source_column": "Client Reference Number",
+      "target_column": "sku",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "PO-88213",
+        "PO-88213",
+        "PO-88214",
+        "PO-88214",
+        "PO-88215"
+      ],
+      "target_samples": [
+        "SKU-1001",
+        "SKU-1002"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Date",
+      "target_column": "date",
+      "confidence": 0.98,
+      "layer": "L2",
+      "correct": null,
+      "flagged_for_review": false,
+      "source_samples": [
+        "2026-07-01",
+        "2026-07-01",
+        "2026-07-01",
+        "2026-07-01",
+        "2026-07-02"
+      ],
+      "target_samples": [
+        "2026-07-01",
+        "2026-07-02"
+      ],
+      "explanation": null,
+      "status": "approved",
+      "exported_at": "2026-08-10T14:08:38.370936+00:00",
+      "export_id": "46c31c93-5976-482a-bd1d-a593954aa580",
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "approved"
+    },
+    {
+      "source_column": "Product Name",
+      "target_column": "quantity",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "Widget Bracket Steel",
+        "Widget Bracket Aluminum",
+        "Hex Bolt 3/8in",
+        "Hex Bolt 1/2in",
+        "Packing Tape 2in"
+      ],
+      "target_samples": [
+        "24",
+        "10"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Quantity On Hand",
+      "target_column": "unit_of_measure",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "240",
+        "180",
+        "5400",
+        "3120",
+        "96"
+      ],
+      "target_samples": [
+        "EA",
+        "CS"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "SKU",
+      "target_column": "product_name",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "CA-1001",
+        "CA-1002",
+        "CA-1003",
+        "CA-1004",
+        "CA-1005"
+      ],
+      "target_samples": [
+        "Widget A",
+        "Widget B"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Unit of Measure",
+      "target_column": "warehouse_location",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "EA",
+        "EA",
+        "EA",
+        "EA",
+        "CS"
+      ],
+      "target_samples": [
+        "A-01-03",
+        "B-02-01"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    },
+    {
+      "source_column": "Warehouse Location",
+      "target_column": "client_reference",
+      "confidence": 0,
+      "layer": "L1-fallback",
+      "correct": null,
+      "flagged_for_review": true,
+      "source_samples": [
+        "A-12-3",
+        "A-12-4",
+        "B-04-1",
+        "B-04-2",
+        "C-01-1"
+      ],
+      "target_samples": [
+        "clientA",
+        "clientB"
+      ],
+      "explanation": null,
+      "status": "pending_review",
+      "exported_at": null,
+      "export_id": null,
+      "rule_id": null,
+      "collision_with": null,
+      "original_status": "pending_review"
+    }
+  ]
+}

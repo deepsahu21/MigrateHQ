@@ -38,5 +38,6 @@ schema-mapping/reports/
 .vscode/
 *.swp
 
-# Demo snapshots & scratch data (dev-only tooling, never committed)
-demo/
+# Demo snapshots: the JSON manifests ARE tracked so a baseline is
+# reproducible from a clean clone. The copied source files are not.
+demo/snapshots/*_source/
