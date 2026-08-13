@@ -24,6 +24,7 @@ node_modules/
 schema-mapping/data/raw/
 schema-mapping/data/manufactured/
 schema-mapping/data/barrelSense/
+schema-mapping/data/uploads/
 
 # Generated reports
 schema-mapping/reports/
@@ -36,3 +37,6 @@ schema-mapping/reports/
 .idea/
 .vscode/
 *.swp
+
+# Demo snapshots & scratch data (dev-only tooling, never committed)
+demo/
